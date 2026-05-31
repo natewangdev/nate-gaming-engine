@@ -13,6 +13,7 @@ pass ``screen_size=(width, height)`` explicitly.
 
 from __future__ import annotations
 
+import math
 import random
 import time
 from dataclasses import dataclass, field
@@ -96,14 +97,21 @@ class Controller:
         button: str = "L",
         hold: float | None = None,
         duration: float | None = None,
+        spread: float = 0.0,
     ) -> None:
         """Optionally move to (px, py), then click ``button``.
 
         ``hold`` is the press duration in seconds; if ``None`` a small randomized
         human-like delay is used.
+
+        ``spread`` is the click landing-point scatter radius in pixels. When > 0
+        and a target is given, the actual landing point is randomized uniformly
+        within a disc of that radius around (px, py), so repeated clicks never hit
+        the exact same pixel.
         """
         if px is not None and py is not None:
-            self.move_to(px, py, duration=duration)
+            tx, ty = self._scatter(px, py, spread)
+            self.move_to(tx, ty, duration=duration)
             time.sleep(self.rng.uniform(0.02, 0.06))
         hold_ms = (
             int(hold * 1000)
@@ -111,6 +119,14 @@ class Controller:
             else self.rng.randint(45, 110)
         )
         self.transport.command(f"CLK {button.upper()} {hold_ms}")
+
+    def _scatter(self, px: float, py: float, spread: float) -> tuple[float, float]:
+        """Return a point uniformly sampled within a disc of ``spread`` px."""
+        if spread <= 0:
+            return px, py
+        angle = self.rng.uniform(0.0, 2.0 * math.pi)
+        radius = spread * math.sqrt(self.rng.random())
+        return px + math.cos(angle) * radius, py + math.sin(angle) * radius
 
     def mouse_down(self, button: str = "L") -> None:
         self.transport.command(f"BTN {button.upper()} 1")

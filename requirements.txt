@@ -4,3 +4,5 @@ opencv-python>=4.8
 # Screen capture: dxcam is fastest on Windows; mss is the cross-platform fallback.
 dxcam>=0.0.5 ; sys_platform == "win32"
 mss>=9.0
+# OCR: RapidOCR (PP-OCR on ONNXRuntime) - strong Chinese support, fast on CPU.
+rapidocr-onnxruntime>=1.3

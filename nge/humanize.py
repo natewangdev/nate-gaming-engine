@@ -30,11 +30,11 @@ class HumanizeConfig:
 
     # Curve shape: how far control points may deviate from the straight line,
     # as a fraction of the path length.
-    curvature: float = 0.18
+    curvature: float = 0.1
     # Per-waypoint positional jitter in pixels.
-    jitter: float = 0.6
+    jitter: float = 0.4
     # Chance to overshoot the target and correct back.
-    overshoot_chance: float = 0.25
+    overshoot_chance: float = 0.15
     overshoot_pixels: float = 14.0
     # Report cadence: target waypoints per second (clamped by duration).
     rate_hz: float = 144.0
@@ -43,9 +43,9 @@ class HumanizeConfig:
     # Maximum pointer speed in pixels/second. Any segment that would move faster
     # than this gets its delay stretched, capping the peak speed to a humanly
     # reachable value. Set to 0 to disable the limit.
-    max_speed: float = 5500.0
+    max_speed: float = 9000.0
     # Chance, per intermediate waypoint, to insert a brief hesitation pause.
-    pause_chance: float = 0.06
+    pause_chance: float = 0.00
     # Hesitation pause duration range in seconds (min, max).
     pause_range: tuple[float, float] = (0.04, 0.14)
 

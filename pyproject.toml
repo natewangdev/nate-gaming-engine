@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nate-gaming-engine"
+version = "0.1.0"
+description = "Hardware-HID game automation toolkit (ESP32-S3 USB HID + vision/OCR)"
+readme = "README.zh-CN.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "natewangdev" }]
+keywords = ["automation", "hid", "esp32", "ocr", "screen-capture"]
+
+# Core dependency: only the serial transport is required for mouse/keyboard.
+dependencies = [
+    "pyserial>=3.5",
+]
+
+[project.optional-dependencies]
+# Template matching / image arrays.
+vision = [
+    "numpy>=1.24",
+    "opencv-python>=4.8",
+]
+# Screen capture backends (dxcam is Windows-only; mss is cross-platform).
+capture = [
+    "dxcam>=0.0.5 ; sys_platform == 'win32'",
+    "mss>=9.0",
+]
+# Text recognition (PP-OCR on ONNXRuntime, strong Chinese support).
+ocr = [
+    "rapidocr-onnxruntime>=1.3",
+]
+# Everything needed for the full bot (capture + vision + ocr).
+all = [
+    "nate-gaming-engine[vision,capture,ocr]",
+]
+
+[tool.setuptools.packages.find]
+include = ["nge*"]

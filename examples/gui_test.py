@@ -26,8 +26,8 @@ class App:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         root.title("NGE HID Test Tool")
-        root.geometry("580x860")
-        root.minsize(540, 720)
+        root.geometry("580x960")
+        root.minsize(540, 800)
 
         self.ctrl: nge.Controller | None = None
         # Shared config object: the controller holds a reference to it, so slider
@@ -35,6 +35,11 @@ class App:
         self.hcfg = HumanizeConfig()
         self.task_q: "queue.Queue" = queue.Queue()
         self.log_q: "queue.Queue[str]" = queue.Queue()
+
+        # OCR state (lazy: capture + engine created on first use).
+        self.ocr_region: tuple[int, int, int, int] | None = None
+        self._ocr_capture = None
+        self._ocr_engine = None
 
         self._build_ui()
 
@@ -143,6 +148,27 @@ class App:
         # --- Humanize tuning (live) ---
         self._build_humanize_sliders()
 
+        # --- OCR ---
+        ocr = ttk.LabelFrame(self.root, text="OCR (region select)")
+        ocr.pack(fill="x", **pad)
+        ttk.Button(ocr, text="Select Region", command=self.on_select_region).grid(
+            row=0, column=0, sticky="we", padx=4, pady=4
+        )
+        self.ocr_region_var = tk.StringVar(value="Region: full screen")
+        ttk.Label(ocr, textvariable=self.ocr_region_var).grid(
+            row=0, column=1, columnspan=3, sticky="w", padx=4
+        )
+        self.ocr_numbers_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(ocr, text="Numbers only", variable=self.ocr_numbers_var).grid(
+            row=1, column=0, sticky="w", padx=4
+        )
+        ttk.Button(ocr, text="Recognize", command=self.on_ocr_read).grid(
+            row=1, column=1, sticky="we", padx=4, pady=4
+        )
+        ttk.Button(ocr, text="Clear Region", command=self.on_clear_region).grid(
+            row=1, column=2, sticky="we", padx=4
+        )
+
         # --- Panic ---
         panic = ttk.Frame(self.root)
         panic.pack(fill="x", **pad)
@@ -210,6 +236,84 @@ class App:
             scale.set(val)
             value_lbl.config(text=fmt.format(val))
         self._log("[ok] Humanize params reset to defaults")
+
+    # ------------------------------------------------------------------ OCR
+    def on_select_region(self) -> None:
+        """Draw a fullscreen overlay and let the user drag a rectangle."""
+        overlay = tk.Toplevel(self.root)
+        overlay.attributes("-fullscreen", True)
+        overlay.attributes("-alpha", 0.25)
+        overlay.attributes("-topmost", True)
+        overlay.configure(cursor="cross", bg="black")
+        canvas = tk.Canvas(overlay, highlightthickness=0, bg="gray20")
+        canvas.pack(fill="both", expand=True)
+        state = {"x0": 0, "y0": 0, "rect": None}
+
+        def on_press(e: tk.Event) -> None:
+            state["x0"], state["y0"] = e.x, e.y
+            state["rect"] = canvas.create_rectangle(
+                e.x, e.y, e.x, e.y, outline="red", width=2
+            )
+
+        def on_drag(e: tk.Event) -> None:
+            if state["rect"] is not None:
+                canvas.coords(state["rect"], state["x0"], state["y0"], e.x, e.y)
+
+        def on_release(e: tk.Event) -> None:
+            left, top = min(state["x0"], e.x), min(state["y0"], e.y)
+            right, bottom = max(state["x0"], e.x), max(state["y0"], e.y)
+            overlay.destroy()
+            if right - left > 2 and bottom - top > 2:
+                self.ocr_region = (left, top, right, bottom)
+                self.ocr_region_var.set(f"Region: ({left},{top},{right},{bottom})")
+                self._log(f"[ocr] region set to {self.ocr_region}")
+
+        def on_cancel(_e: tk.Event) -> None:
+            overlay.destroy()
+
+        canvas.bind("<ButtonPress-1>", on_press)
+        canvas.bind("<B1-Motion>", on_drag)
+        canvas.bind("<ButtonRelease-1>", on_release)
+        overlay.bind("<Escape>", on_cancel)
+        overlay.focus_force()
+
+    def on_clear_region(self) -> None:
+        self.ocr_region = None
+        self.ocr_region_var.set("Region: full screen")
+        self._log("[ocr] region cleared (full screen)")
+
+    def on_ocr_read(self) -> None:
+        region = self.ocr_region
+        numbers = self.ocr_numbers_var.get()
+
+        def task() -> None:
+            try:
+                if self._ocr_capture is None:
+                    from nge.capture import ScreenCapture
+
+                    self._ocr_capture = ScreenCapture()
+                if self._ocr_engine is None:
+                    from nge.ocr import OCREngine
+
+                    self._log("[ocr] loading engine (first run may take a moment)...")
+                    self._ocr_engine = OCREngine()
+                frame = self._ocr_capture.grab()
+                if frame is None:
+                    self._log("[error] OCR: no frame captured")
+                    return
+                if numbers:
+                    nums = self._ocr_engine.read_numbers(frame, region=region)
+                    self._log(f"[ocr] numbers: {nums}")
+                else:
+                    results = self._ocr_engine.read(frame, region=region)
+                    if not results:
+                        self._log("[ocr] no text found")
+                    for r in results:
+                        self._log(f"[ocr] {r.text!r} @ ({r.x},{r.y}) score={r.score:.2f}")
+            except Exception as exc:  # noqa: BLE001
+                self._log(f"[error] OCR failed: {exc}")
+
+        self._enqueue(task)
 
     # -------------------------------------------------------------- helpers
     def _log(self, msg: str) -> None:

@@ -41,10 +41,12 @@ English: 暂未提供（如需英文主文档可后续补充 `README.md`）。
 - ESP32-S3 自定义 **复合 HID**：绝对坐标鼠标（0–32767）+ 键盘。
 - 简洁的**文本行串口协议**，每条命令带应答（`OK`/`PONG`/`ERR`）。
 - **拟人化路径**：三次贝塞尔曲线、缓动、手抖、过冲回拉、随机停顿、**峰值速度上限**。
-- 高层 Python API：`move_to` / `click` / `press` / `hotkey`。
+- 高层 Python API：`move_to` / `click`（支持落点散布 `spread`）/ `press` / `hotkey`。
 - 像素坐标自动映射到 HID 设备坐标。
 - 截屏（dxcam / mss）+ OpenCV 模板匹配。
-- 图形测试工具（tkinter），含拟人参数**实时滑块**。
+- **OCR 文字识别**（RapidOCR，中文友好）：支持区域裁剪、只识别数字。
+- 决策循环引擎（`bot.py`）：优先级规则、冷却、拟人休息、会话上限。
+- 图形测试工具（tkinter），含拟人参数**实时滑块**与 **OCR 框选识别**。
 - 物理急停（开发板 BOOT 键）+ 软件急停（`STOP`）。
 
 ## 架构
@@ -71,9 +73,9 @@ English: 暂未提供（如需英文主文档可后续补充 `README.md`）。
 
 - [Arduino IDE](https://www.arduino.cc/en/software) + ESP32 开发板支持包（Espressif）。
 - Python 3.10+（使用了 `X | Y` 类型注解语法）。
-- 依赖见 [`requirements.txt`](requirements.txt)：`pyserial`、`numpy`、`opencv-python`、`dxcam`（Windows）、`mss`。
+- 依赖见 [`requirements.txt`](requirements.txt)：`pyserial`、`numpy`、`opencv-python`、`dxcam`（Windows）、`mss`、`rapidocr-onnxruntime`（OCR）。
 
-  > 仅测试键鼠时只需 `pyserial`；截屏/识别才需要其余依赖。
+  > 仅测试键鼠时只需 `pyserial`；截屏/模板匹配需 `numpy`/`opencv-python`/`dxcam`/`mss`；文字识别额外需 `rapidocr-onnxruntime`。
 
 ## 快速开始
 
@@ -199,12 +201,66 @@ ctrl.press("space")
 ctrl.press("1")                      # 数字键
 ctrl.hotkey("ctrl", "a")             # 组合键
 
+# 点击落点散布：在目标半径 spread(px) 圆内随机落点，避免每次点同一像素
+ctrl.click(960, 540, spread=10)
+
 # 急停 / 关闭
 ctrl.stop()
 ctrl.transport.close()
 ```
 
 屏幕尺寸默认取主显示器，可手动指定：`nge.connect(screen_size=(2560, 1440))`。
+
+### OCR 文字识别
+
+基于 RapidOCR（中文友好、CPU 快）。**务必传 `region` 只识别目标区域**以保证速度。
+
+```python
+from nge.capture import ScreenCapture
+from nge.ocr import OCREngine
+
+ocr = OCREngine()                    # 懒加载，首次调用才初始化模型
+frame = ScreenCapture().grab()
+
+region = (800, 0, 1760, 120)         # (left, top, right, bottom) 只识别顶部窄条
+ocr.read_text(frame, region=region)              # -> 拼接成字符串
+ocr.read(frame, region=region)                   # -> [OCRResult(text, score, x, y, box), ...]
+ocr.find_text(frame, "确定", region=region)       # -> 最佳匹配（坐标可直接点击）
+ocr.read_number(frame, region=region)            # -> 第一个数字（int/float），如读血量
+ocr.read_numbers(frame, region=region)           # -> 区域内所有数字
+```
+
+### 决策循环（bot）
+
+```python
+import nge
+from nge.bot import Bot, BotConfig
+from nge.capture import ScreenCapture
+
+bot = Bot(
+    nge.connect(),
+    ScreenCapture(),
+    config=BotConfig(tick_hz=8, break_every=180),
+    asset_root=r"C:\path\to\resources",   # 相对资源路径（模板等）的根目录
+)
+
+@bot.rule(name="pickup", priority=10, cooldown=0.4)
+def pickup(ctx):
+    m = ctx.find("templates/loot.png", threshold=0.85)   # 相对 asset_root 解析
+    if m:
+        ctx.controller.click(m.x, m.y, spread=8)
+        return True                                       # True = 已行动
+    return False
+
+@bot.rule(name="potion", priority=30, cooldown=2.0)
+def potion(ctx):
+    if (hp := ctx.read_number(region=(1000, 1330, 1200, 1400))) and hp < 300:
+        ctx.controller.press("q")
+        return True
+    return False
+
+bot.run()   # Ctrl+C 停止；退出自动释放键鼠并关闭截图器
+```
 
 ## 项目结构
 
@@ -220,11 +276,15 @@ nate-gaming-engine/
 │  ├─ humanize.py           # 拟人路径：贝塞尔/缓动/抖动/过冲/限速/停顿
 │  ├─ controller.py         # 高层 API：move_to / click / press / hotkey
 │  ├─ capture.py            # dxcam / mss 截屏
-│  └─ vision.py             # OpenCV 模板匹配
+│  ├─ vision.py             # OpenCV 模板匹配
+│  ├─ ocr.py                # RapidOCR 文字识别（区域裁剪、数字识别）
+│  └─ bot.py                # 决策循环引擎：规则 / 冷却 / 拟人休息
 ├─ examples/
 │  ├─ quickstart.py         # 最小冒烟示例
 │  ├─ test_io.py            # 交互式命令行测试
-│  └─ gui_test.py           # 图形测试工具（含拟人参数滑块）
+│  ├─ gui_test.py           # 图形测试工具（拟人滑块 + OCR 框选）
+│  ├─ ocr_example.py        # 区域 OCR 示例
+│  └─ bot_example.py        # 决策循环示例骨架
 ├─ requirements.txt
 ├─ LICENSE
 └─ README.zh-CN.md
@@ -234,9 +294,11 @@ nate-gaming-engine/
 
 | 脚本 | 用途 |
 |------|------|
-| `examples/gui_test.py` | tkinter 图形界面：输入坐标、点击、按键、拟人参数实时滑块 |
+| `examples/gui_test.py` | tkinter 图形界面：坐标/点击/按键、拟人参数实时滑块、OCR 框选识别 |
 | `examples/test_io.py` | 命令行交互菜单：逐项测试鼠标/键盘 |
 | `examples/quickstart.py` | 连接→移动→点击→按键的最小流程 |
+| `examples/ocr_example.py` | 区域 OCR：识别文字 / 数字 / 查找指定文字 |
+| `examples/bot_example.py` | 决策循环骨架：模板匹配 + OCR + 规则 |
 
 ## 风险与免责声明
 

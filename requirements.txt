@@ -1,0 +1,6 @@
+pyserial>=3.5
+numpy>=1.24
+opencv-python>=4.8
+# Screen capture: dxcam is fastest on Windows; mss is the cross-platform fallback.
+dxcam>=0.0.5 ; sys_platform == "win32"
+mss>=9.0

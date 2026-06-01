@@ -6,3 +6,5 @@ dxcam>=0.0.5 ; sys_platform == "win32"
 mss>=9.0
 # OCR: RapidOCR (PP-OCR on ONNXRuntime) - strong Chinese support, fast on CPU.
 rapidocr-onnxruntime>=1.3
+# YOLO object detection runtime (ONNX). onnxruntime is also pulled in by RapidOCR.
+onnxruntime>=1.16

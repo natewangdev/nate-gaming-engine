@@ -32,9 +32,13 @@ capture = [
 ocr = [
     "rapidocr-onnxruntime>=1.3",
 ]
-# Everything needed for the full bot (capture + vision + ocr).
+# YOLO object detection via ONNXRuntime (no PyTorch at runtime).
+detect = [
+    "onnxruntime>=1.16",
+]
+# Everything needed for the full bot (capture + vision + ocr + detect).
 all = [
-    "nate-gaming-engine[vision,capture,ocr]",
+    "nate-gaming-engine[vision,capture,ocr,detect]",
 ]
 
 [tool.setuptools.packages.find]

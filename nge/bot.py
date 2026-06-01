@@ -40,6 +40,7 @@ import numpy as np
 
 from .capture import ScreenCapture
 from .controller import Controller
+from .detect import Detection, YoloDetector
 from .logger import get_logger
 from .ocr import OCREngine, OCRResult, Region
 from .vision import Match, find_all, find_template, load_template
@@ -85,6 +86,7 @@ class BotContext:
     _region_offset: tuple[int, int] = (0, 0)
     _asset_root: Path | None = None
     _ocr: OCREngine | None = None
+    _detector: YoloDetector | None = None
 
     def find(self, template_path: str, threshold: float = 0.85) -> Match | None:
         """Find the best match of a template in the current frame."""
@@ -135,6 +137,45 @@ class BotContext:
             res.box = [(px + ox, py + oy) for px, py in res.box]
         return res
 
+    @property
+    def detector(self) -> YoloDetector:
+        """The YOLO detector (must be configured via ``Bot(yolo_model=...)``)."""
+        if self._detector is None:
+            raise RuntimeError(
+                "No YOLO model configured. Pass yolo_model=... to Bot(...)."
+            )
+        return self._detector
+
+    def detect(
+        self,
+        region: Region | None = None,
+        conf: float = 0.5,
+        classes: list[str | int] | None = None,
+    ) -> list[Detection]:
+        """Detect objects in the current frame; coords mapped to screen space."""
+        dets = self.detector.detect(self.frame, region=region, conf=conf, classes=classes)
+        return [self._shift_detection(d) for d in dets]
+
+    def find_object(
+        self,
+        label: str,
+        region: Region | None = None,
+        conf: float = 0.5,
+    ) -> Detection | None:
+        """Find the best detection matching ``label`` (coords in screen space)."""
+        d = self.detector.find(self.frame, label, region=region, conf=conf)
+        return self._shift_detection(d) if d is not None else None
+
+    def _shift_detection(self, d: Detection) -> Detection:
+        ox, oy = self._region_offset
+        if (ox, oy) == (0, 0):
+            return d
+        x1, y1, x2, y2 = d.box
+        d.box = (x1 + ox, y1 + oy, x2 + ox, y2 + oy)
+        d.x += ox
+        d.y += oy
+        return d
+
     def asset_path(self, path: str) -> str:
         """Resolve ``path`` against the asset root (if set and path is relative)."""
         p = Path(path)
@@ -174,6 +215,7 @@ class Bot:
         config: BotConfig | None = None,
         rng: random.Random | None = None,
         asset_root: str | Path | None = None,
+        yolo_model: str | Path | None = None,
     ) -> None:
         self.controller = controller
         self.capture = capture
@@ -184,6 +226,8 @@ class Bot:
         # Base directory for resolving relative resource paths (e.g. templates).
         self.asset_root = Path(asset_root) if asset_root is not None else None
 
+        detector = YoloDetector(str(yolo_model)) if yolo_model is not None else None
+
         offset = (0, 0)
         if capture.region is not None:
             offset = (capture.region[0], capture.region[1])
@@ -192,6 +236,7 @@ class Bot:
             capture=capture,
             _region_offset=offset,
             _asset_root=self.asset_root,
+            _detector=detector,
         )
 
     # ----------------------------------------------------------- rule setup

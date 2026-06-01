@@ -45,6 +45,7 @@ English: 暂未提供（如需英文主文档可后续补充 `README.md`）。
 - 像素坐标自动映射到 HID 设备坐标。
 - 截屏（dxcam / mss）+ OpenCV 模板匹配。
 - **OCR 文字识别**（RapidOCR，中文友好）：支持区域裁剪、只识别数字。
+- **YOLO 目标检测**（ONNX + onnxruntime，运行时无需 PyTorch）：区域裁剪、坐标对齐屏幕。
 - 决策循环引擎（`bot.py`）：优先级规则、冷却、拟人休息、会话上限。
 - 图形测试工具（tkinter），含拟人参数**实时滑块**与 **OCR 框选识别**。
 - 物理急停（开发板 BOOT 键）+ 软件急停（`STOP`）。
@@ -73,9 +74,9 @@ English: 暂未提供（如需英文主文档可后续补充 `README.md`）。
 
 - [Arduino IDE](https://www.arduino.cc/en/software) + ESP32 开发板支持包（Espressif）。
 - Python 3.10+（使用了 `X | Y` 类型注解语法）。
-- 依赖见 [`requirements.txt`](requirements.txt)：`pyserial`、`numpy`、`opencv-python`、`dxcam`（Windows）、`mss`、`rapidocr-onnxruntime`（OCR）。
+- 依赖见 [`requirements.txt`](requirements.txt)：`pyserial`、`numpy`、`opencv-python`、`dxcam`（Windows）、`mss`、`rapidocr-onnxruntime`（OCR）、`onnxruntime`（YOLO 检测）。
 
-  > 仅测试键鼠时只需 `pyserial`；截屏/模板匹配需 `numpy`/`opencv-python`/`dxcam`/`mss`；文字识别额外需 `rapidocr-onnxruntime`。
+  > 仅测试键鼠时只需 `pyserial`；截屏/模板匹配需 `numpy`/`opencv-python`/`dxcam`/`mss`；文字识别额外需 `rapidocr-onnxruntime`；YOLO 检测额外需 `onnxruntime`（RapidOCR 已包含）。**训练/导出**模型才需 `ultralytics`+PyTorch，运行时不需要。
 
 ## 快速开始
 
@@ -230,6 +231,53 @@ ocr.read_number(frame, region=region)            # -> 第一个数字（int/floa
 ocr.read_numbers(frame, region=region)           # -> 区域内所有数字
 ```
 
+### YOLO 目标检测
+
+适合**会变形/变大小/位置不固定**的目标（怪物、掉落物、世界标记）；固定的 UI 图标用模板匹配更省事。运行时只用 `onnxruntime`，不背 PyTorch。
+
+**准备模型**（仅训练/导出阶段需要 `ultralytics`）：
+
+```powershell
+pip install ultralytics
+# 1) 标注数据集（Roboflow / X-AnyLabeling 等），训练自定义模型
+yolo detect train data=d4.yaml model=yolo11n.pt epochs=100 imgsz=640
+# 2) 导出 ONNX（之后运行时只需 onnxruntime）
+yolo export model=runs/detect/train/weights/best.pt format=onnx
+```
+
+> COCO 预训练模型只认通用类别（人、车等），**识别游戏目标必须自己标注训练**。导出的 ONNX 会内嵌类别名，框架自动读取。
+
+**使用**：
+
+```python
+from nge.capture import ScreenCapture
+from nge.detect import YoloDetector
+
+det = YoloDetector(r"C:\path\to\best.onnx")   # 懒加载；有 CUDA 自动用 GPU，否则 CPU
+frame = ScreenCapture().grab()
+
+# 整屏或区域检测（传 region 裁剪提速，和 OCR 一致）
+dets = det.detect(frame, conf=0.4)            # -> [Detection(label, class_id, conf, x, y, box), ...]
+dets = det.detect(frame, region=(0, 0, 1280, 720), conf=0.4, classes=["monster"])
+best = det.find(frame, "monster", conf=0.45)  # -> 最高分的单个目标
+# Detection 坐标为屏幕空间，可直接喂给 controller.click(best.x, best.y)
+```
+
+接进 bot：给 `Bot(..., yolo_model=...)`，规则里用 `ctx.detect(...)` / `ctx.find_object(...)`：
+
+```python
+bot = Bot(nge.connect(), ScreenCapture(),
+          asset_root=ASSET_ROOT, yolo_model=r"C:\path\to\best.onnx")
+
+@bot.rule(name="attack", priority=15, cooldown=0.3)
+def attack(ctx):
+    m = ctx.find_object("monster", conf=0.45)   # 坐标自动叠加截屏区域偏移
+    if m:
+        ctx.controller.click(m.x, m.y, spread=10)
+        return True
+    return False
+```
+
 ### 决策循环（bot）
 
 ```python
@@ -242,6 +290,7 @@ bot = Bot(
     ScreenCapture(),
     config=BotConfig(tick_hz=8, break_every=180),
     asset_root=r"C:\path\to\resources",   # 相对资源路径（模板等）的根目录
+    yolo_model=r"C:\path\to\best.onnx",   # 可选：启用 ctx.detect / ctx.find_object
 )
 
 @bot.rule(name="pickup", priority=10, cooldown=0.4)
@@ -278,12 +327,14 @@ nate-gaming-engine/
 │  ├─ capture.py            # dxcam / mss 截屏
 │  ├─ vision.py             # OpenCV 模板匹配
 │  ├─ ocr.py                # RapidOCR 文字识别（区域裁剪、数字识别）
+│  ├─ detect.py             # YOLO 目标检测（ONNX + onnxruntime）
 │  └─ bot.py                # 决策循环引擎：规则 / 冷却 / 拟人休息
 ├─ examples/
 │  ├─ quickstart.py         # 最小冒烟示例
 │  ├─ test_io.py            # 交互式命令行测试
 │  ├─ gui_test.py           # 图形测试工具（拟人滑块 + OCR 框选）
 │  ├─ ocr_example.py        # 区域 OCR 示例
+│  ├─ detect_example.py     # YOLO 目标检测示例
 │  └─ bot_example.py        # 决策循环示例骨架
 ├─ requirements.txt
 ├─ LICENSE
@@ -298,6 +349,7 @@ nate-gaming-engine/
 | `examples/test_io.py` | 命令行交互菜单：逐项测试鼠标/键盘 |
 | `examples/quickstart.py` | 连接→移动→点击→按键的最小流程 |
 | `examples/ocr_example.py` | 区域 OCR：识别文字 / 数字 / 查找指定文字 |
+| `examples/detect_example.py` | YOLO 目标检测：整屏/区域检测、按类查找 |
 | `examples/bot_example.py` | 决策循环骨架：模板匹配 + OCR + 规则 |
 
 ## 风险与免责声明

@@ -42,13 +42,21 @@ def build_bot() -> Bot:
 
     bot = Bot(controller, capture, config=config, asset_root=ASSET_ROOT)
 
+    # 初始化共享状态（在注册 rule 之前或之后都行，只要在 bot.run() 之前）
+    bot.ctx.state.update({
+        "teamed_up": False,
+        "loot_count": 0,
+        "last_town_at": 0.0,
+    })
+
     # --- Rules: higher priority is evaluated first ---
 
-    @bot.rule(name="pickup_loot", priority=10, cooldown=0.4)
-    def pickup_loot(ctx) -> bool:
-        m = ctx.find("images/ceshi1.png", threshold=0.85)
+    @bot.rule(name="team_up", priority=10, cooldown=10.0)
+    def team_up(ctx) -> bool:
+        m = ctx.find("images/huangmen.png", threshold=0.85)
         if m:
             ctx.controller.click(m.x, m.y, spread=10)
+            
             return True
         return False
 

@@ -38,6 +38,31 @@ class OCRResult:
     box: list[tuple[int, int]]  # 4 corner points, offset-applied
 
 
+def _active_provider(engine: object) -> str | None:
+    """Best-effort read of the onnxruntime provider RapidOCR is actually using.
+
+    RapidOCR-onnxruntime wraps three models (det/cls/rec); each holds an
+    ``OrtInferSession`` whose ``.session`` is the real ``InferenceSession``. The
+    exact attribute names vary across versions, so probe defensively and return
+    the first provider found.
+    """
+    for model_attr in ("text_rec", "text_det", "text_cls"):
+        model = getattr(engine, model_attr, None)
+        if model is None:
+            continue
+        ort_wrap = getattr(model, "session", None)
+        sess = getattr(ort_wrap, "session", ort_wrap)
+        get_providers = getattr(sess, "get_providers", None)
+        if callable(get_providers):
+            try:
+                providers = get_providers()
+            except Exception:  # noqa: BLE001
+                continue
+            if providers:
+                return providers[0]
+    return None
+
+
 def _crop(image: np.ndarray, region: Region | None) -> tuple[np.ndarray, tuple[int, int]]:
     """Return (cropped_image, (offset_x, offset_y)). No-op when region is None."""
     if region is None:
@@ -75,7 +100,12 @@ class OCREngine:
                 "RapidOCR is not installed. Run: pip install rapidocr-onnxruntime"
             ) from exc
         self._engine = RapidOCR(**self.engine_kwargs)
-        log.info("OCR engine ready (RapidOCR)")
+        provider = _active_provider(self._engine)
+        mode = "GPU" if provider and provider.startswith("CUDA") else "CPU"
+        log.info(
+            "OCR engine ready (RapidOCR) [%s mode] (provider=%s)",
+            mode, provider or "unknown",
+        )
 
     def read(
         self,

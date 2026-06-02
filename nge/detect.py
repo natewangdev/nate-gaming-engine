@@ -104,9 +104,13 @@ class YoloDetector:
 
         if not self.names:
             self.names = self._read_names()
+
+        # Read the provider actually in use (CUDA may silently fall back to CPU).
+        active = self._session.get_providers()[0]
+        mode = "GPU" if active.startswith("CUDA") else "CPU"
         log.info(
-            "YOLO detector ready (%s, input=%d, %d classes)",
-            providers[0], self.input_size, len(self.names),
+            "YOLO detector ready [%s mode] (provider=%s, input=%d, %d classes)",
+            mode, active, self.input_size, len(self.names),
         )
 
     def _read_names(self) -> dict[int, str]:

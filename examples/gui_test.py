@@ -14,20 +14,27 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
+from datetime import datetime
+from pathlib import Path
 import tkinter as tk
-from tkinter import ttk
+from tkinter import filedialog, ttk
 
 import nge
 from nge.humanize import HumanizeConfig
 from nge.transport import SerialTransport, find_port
+
+# Default save folder for dataset screenshots (under the repo root).
+DEFAULT_CAPTURE_DIR = str(Path(__file__).resolve().parent.parent / "captures")
+DEFAULT_CAPTURE_INTERVAL = "1.0"  # seconds
 
 
 class App:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         root.title("NGE HID Test Tool")
-        root.geometry("580x960")
-        root.minsize(540, 800)
+        root.geometry("580x1200")
+        root.minsize(540, 960)
 
         self.ctrl: nge.Controller | None = None
         # Shared config object: the controller holds a reference to it, so slider
@@ -40,6 +47,13 @@ class App:
         self.ocr_region: tuple[int, int, int, int] | None = None
         self._ocr_capture = None
         self._ocr_engine = None
+
+        # Dataset capture state (its own ScreenCapture + dedicated thread).
+        self.cap_region: tuple[int, int, int, int] | None = None
+        self._cap_capture = None
+        self._cap_thread: threading.Thread | None = None
+        self._cap_stop = threading.Event()
+        self._cap_count = 0
 
         self._build_ui()
 
@@ -169,6 +183,72 @@ class App:
             row=1, column=2, sticky="we", padx=4
         )
 
+        # --- Dataset capture ---
+        cap = ttk.LabelFrame(self.root, text="Dataset capture (screenshots)")
+        cap.pack(fill="x", **pad)
+        cap.columnconfigure(1, weight=1)
+
+        ttk.Label(cap, text="Save dir:").grid(row=0, column=0, sticky="e", padx=4, pady=4)
+        self.cap_dir_var = tk.StringVar(value=DEFAULT_CAPTURE_DIR)
+        ttk.Entry(cap, textvariable=self.cap_dir_var).grid(
+            row=0, column=1, columnspan=2, sticky="we", padx=4
+        )
+        ttk.Button(cap, text="Browse...", command=self.on_cap_browse).grid(
+            row=0, column=3, sticky="we", padx=4
+        )
+
+        ttk.Button(cap, text="Select Region", command=self.on_cap_select_region).grid(
+            row=1, column=0, sticky="we", padx=4, pady=4
+        )
+        self.cap_region_var = tk.StringVar(value="Region: full screen")
+        ttk.Label(cap, textvariable=self.cap_region_var).grid(
+            row=1, column=1, columnspan=2, sticky="w", padx=4
+        )
+        ttk.Button(cap, text="Clear Region", command=self.on_cap_clear_region).grid(
+            row=1, column=3, sticky="we", padx=4
+        )
+
+        ttk.Label(cap, text="Interval (s):").grid(row=2, column=0, sticky="e", padx=4, pady=4)
+        self.cap_interval_var = tk.StringVar(value=DEFAULT_CAPTURE_INTERVAL)
+        ttk.Entry(cap, textvariable=self.cap_interval_var, width=8).grid(
+            row=2, column=1, sticky="w", padx=4
+        )
+        self.cap_status_var = tk.StringVar(value="Idle - 0 saved")
+        ttk.Label(cap, textvariable=self.cap_status_var).grid(
+            row=2, column=2, columnspan=2, sticky="w", padx=4
+        )
+
+        # Format / quality / resize: defaults tuned for YOLO datasets (small JPG).
+        ttk.Label(cap, text="Format:").grid(row=3, column=0, sticky="e", padx=4, pady=4)
+        self.cap_format_var = tk.StringVar(value="jpg")
+        fmt_box = ttk.Combobox(
+            cap, textvariable=self.cap_format_var, values=["jpg", "png"],
+            width=6, state="readonly",
+        )
+        fmt_box.grid(row=3, column=1, sticky="w", padx=4)
+
+        ttk.Label(cap, text="JPG quality:").grid(row=3, column=2, sticky="e", padx=4)
+        self.cap_quality_var = tk.StringVar(value="90")
+        ttk.Entry(cap, textvariable=self.cap_quality_var, width=6).grid(
+            row=3, column=3, sticky="w", padx=4
+        )
+
+        ttk.Label(cap, text="Max width (0=keep):").grid(row=4, column=0, sticky="e", padx=4, pady=4)
+        self.cap_maxw_var = tk.StringVar(value="0")
+        ttk.Entry(cap, textvariable=self.cap_maxw_var, width=8).grid(
+            row=4, column=1, sticky="w", padx=4
+        )
+        ttk.Label(cap, text="(downscale wider images)").grid(
+            row=4, column=2, columnspan=2, sticky="w", padx=4
+        )
+
+        self.cap_start_btn = ttk.Button(cap, text="Start", command=self.on_cap_start)
+        self.cap_start_btn.grid(row=5, column=0, columnspan=2, sticky="we", padx=4, pady=4)
+        self.cap_stop_btn = ttk.Button(
+            cap, text="Stop", command=self.on_cap_stop, state="disabled"
+        )
+        self.cap_stop_btn.grid(row=5, column=2, columnspan=2, sticky="we", padx=4)
+
         # --- Panic ---
         panic = ttk.Frame(self.root)
         panic.pack(fill="x", **pad)
@@ -237,9 +317,9 @@ class App:
             value_lbl.config(text=fmt.format(val))
         self._log("[ok] Humanize params reset to defaults")
 
-    # ------------------------------------------------------------------ OCR
-    def on_select_region(self) -> None:
-        """Draw a fullscreen overlay and let the user drag a rectangle."""
+    # -------------------------------------------------------- region overlay
+    def _drag_region(self, on_done) -> None:
+        """Draw a fullscreen overlay; call on_done(left, top, right, bottom)."""
         overlay = tk.Toplevel(self.root)
         overlay.attributes("-fullscreen", True)
         overlay.attributes("-alpha", 0.25)
@@ -264,9 +344,7 @@ class App:
             right, bottom = max(state["x0"], e.x), max(state["y0"], e.y)
             overlay.destroy()
             if right - left > 2 and bottom - top > 2:
-                self.ocr_region = (left, top, right, bottom)
-                self.ocr_region_var.set(f"Region: ({left},{top},{right},{bottom})")
-                self._log(f"[ocr] region set to {self.ocr_region}")
+                on_done(left, top, right, bottom)
 
         def on_cancel(_e: tk.Event) -> None:
             overlay.destroy()
@@ -276,6 +354,15 @@ class App:
         canvas.bind("<ButtonRelease-1>", on_release)
         overlay.bind("<Escape>", on_cancel)
         overlay.focus_force()
+
+    # ------------------------------------------------------------------ OCR
+    def on_select_region(self) -> None:
+        def done(left: int, top: int, right: int, bottom: int) -> None:
+            self.ocr_region = (left, top, right, bottom)
+            self.ocr_region_var.set(f"Region: ({left},{top},{right},{bottom})")
+            self._log(f"[ocr] region set to {self.ocr_region}")
+
+        self._drag_region(done)
 
     def on_clear_region(self) -> None:
         self.ocr_region = None
@@ -314,6 +401,128 @@ class App:
                 self._log(f"[error] OCR failed: {exc}")
 
         self._enqueue(task)
+
+    # -------------------------------------------------------- dataset capture
+    def on_cap_browse(self) -> None:
+        initial = self.cap_dir_var.get().strip() or DEFAULT_CAPTURE_DIR
+        chosen = filedialog.askdirectory(initialdir=initial, title="Select save folder")
+        if chosen:
+            self.cap_dir_var.set(chosen)
+
+    def on_cap_select_region(self) -> None:
+        def done(left: int, top: int, right: int, bottom: int) -> None:
+            self.cap_region = (left, top, right, bottom)
+            self.cap_region_var.set(f"Region: ({left},{top},{right},{bottom})")
+            self._log(f"[capture] region set to {self.cap_region}")
+
+        self._drag_region(done)
+
+    def on_cap_clear_region(self) -> None:
+        self.cap_region = None
+        self.cap_region_var.set("Region: full screen")
+        self._log("[capture] region cleared (full screen)")
+
+    def on_cap_start(self) -> None:
+        if self._cap_thread is not None and self._cap_thread.is_alive():
+            self._log("[capture] already running")
+            return
+        try:
+            interval = float(self.cap_interval_var.get())
+            if interval <= 0:
+                raise ValueError
+        except ValueError:
+            self._log("[error] Interval must be a positive number")
+            return
+        save_dir = Path(self.cap_dir_var.get().strip() or DEFAULT_CAPTURE_DIR)
+        try:
+            save_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"[error] cannot create save dir: {exc}")
+            return
+
+        fmt = self.cap_format_var.get().strip().lower()
+        try:
+            quality = max(1, min(100, int(self.cap_quality_var.get())))
+        except ValueError:
+            self._log("[error] JPG quality must be an integer (1-100)")
+            return
+        try:
+            max_w = max(0, int(self.cap_maxw_var.get()))
+        except ValueError:
+            self._log("[error] Max width must be an integer (0 = keep)")
+            return
+
+        region = self.cap_region
+        self._cap_count = 0
+        self._cap_stop.clear()
+        self._cap_thread = threading.Thread(
+            target=self._capture_loop,
+            args=(save_dir, region, interval, fmt, quality, max_w),
+            daemon=True,
+        )
+        self._cap_thread.start()
+        self.cap_start_btn.config(state="disabled")
+        self.cap_stop_btn.config(state="normal")
+        self._log(
+            f"[capture] started -> {save_dir} (every {interval:g}s, region={region}, "
+            f"{fmt}{'/q'+str(quality) if fmt == 'jpg' else ''}, max_w={max_w or 'keep'})"
+        )
+
+    def on_cap_stop(self) -> None:
+        self._cap_stop.set()
+        self.cap_start_btn.config(state="normal")
+        self.cap_stop_btn.config(state="disabled")
+        self._log(f"[capture] stopped - {self._cap_count} image(s) saved")
+
+    def _capture_loop(
+        self, save_dir: Path, region, interval: float,
+        fmt: str, quality: int, max_w: int,
+    ) -> None:
+        try:
+            import cv2
+
+            if self._cap_capture is None:
+                from nge.capture import ScreenCapture
+
+                self._cap_capture = ScreenCapture()
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"[error] capture init failed: {exc}")
+            self.root.after(0, self.on_cap_stop)
+            return
+
+        ext = "jpg" if fmt == "jpg" else "png"
+        write_params = [cv2.IMWRITE_JPEG_QUALITY, quality] if ext == "jpg" else []
+
+        while not self._cap_stop.is_set():
+            start = time.monotonic()
+            try:
+                frame = self._cap_capture.grab()
+                if frame is None:
+                    self._log("[capture] no frame, skipping")
+                else:
+                    if region is not None:
+                        l, t, r, b = region
+                        frame = frame[t:b, l:r]
+                    if max_w and frame.shape[1] > max_w:
+                        scale = max_w / frame.shape[1]
+                        new_h = int(round(frame.shape[0] * scale))
+                        frame = cv2.resize(
+                            frame, (max_w, new_h), interpolation=cv2.INTER_AREA
+                        )
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+                    path = save_dir / f"shot_{ts}.{ext}"
+                    if cv2.imwrite(str(path), frame, write_params):
+                        self._cap_count += 1
+                        self.cap_status_var.set(f"Running - {self._cap_count} saved")
+                    else:
+                        self._log(f"[error] imwrite failed: {path}")
+            except Exception as exc:  # noqa: BLE001
+                self._log(f"[error] capture failed: {exc}")
+            # Sleep the remaining interval, but stay responsive to Stop.
+            elapsed = time.monotonic() - start
+            self._cap_stop.wait(max(0.0, interval - elapsed))
+
+        self.cap_status_var.set(f"Idle - {self._cap_count} saved")
 
     # -------------------------------------------------------------- helpers
     def _log(self, msg: str) -> None:

@@ -13,6 +13,7 @@ Run from the repo root with the serial monitor CLOSED:
 from __future__ import annotations
 
 import queue
+import sys
 import threading
 import time
 from datetime import datetime
@@ -25,16 +26,21 @@ from nge.humanize import HumanizeConfig
 from nge.transport import SerialTransport, find_port
 
 # Default save folder for dataset screenshots (under the repo root).
-DEFAULT_CAPTURE_DIR = str(Path(__file__).resolve().parent.parent / "captures")
+DEFAULT_CAPTURE_DIR = r"C:\Users\Admin\Pictures\d4captures"
 DEFAULT_CAPTURE_INTERVAL = "1.0"  # seconds
+DEFAULT_YOLO_MODEL = (
+    r"D:\Project\ultralytics-8.3.163\runs\detect\d4\weights\best.onnx"
+)
 
 
 class App:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         root.title("NGE HID Test Tool")
-        root.geometry("580x1200")
-        root.minsize(540, 960)
+        root.geometry("580x860")
+        root.minsize(540, 640)
+        root.columnconfigure(0, weight=1)
+        root.rowconfigure(2, weight=1)
 
         self.ctrl: nge.Controller | None = None
         # Shared config object: the controller holds a reference to it, so slider
@@ -48,14 +54,24 @@ class App:
         self._ocr_capture = None
         self._ocr_engine = None
 
+        # YOLO state (lazy: capture + detector created on first use).
+        self.yolo_region: tuple[int, int, int, int] | None = None
+        self._yolo_capture = None
+        self._yolo_detector = None
+        self._yolo_detector_path: str | None = None
+        self._yolo_overlay: tk.Toplevel | None = None
+
         # Dataset capture state (its own ScreenCapture + dedicated thread).
         self.cap_region: tuple[int, int, int, int] | None = None
         self._cap_capture = None
         self._cap_thread: threading.Thread | None = None
         self._cap_stop = threading.Event()
         self._cap_count = 0
+        self._cap_manual_busy = False
+        self._cap_lock = threading.Lock()
 
         self._build_ui()
+        self._setup_prtsc_hotkey()
 
         # Single worker thread owns all serial access.
         threading.Thread(target=self._worker, daemon=True).start()
@@ -65,9 +81,58 @@ class App:
     def _build_ui(self) -> None:
         pad = {"padx": 6, "pady": 4}
 
-        # --- Connection ---
+        self._build_connection_bar(pad)
+
+        notebook = ttk.Notebook(self.root)
+        notebook.grid(row=1, column=0, sticky="nsew", **pad)
+
+        tab_hid = ttk.Frame(notebook, padding=4)
+        tab_ocr = ttk.Frame(notebook, padding=4)
+        tab_yolo = ttk.Frame(notebook, padding=4)
+        tab_cap = ttk.Frame(notebook, padding=4)
+        notebook.add(tab_hid, text="HID Control")
+        notebook.add(tab_ocr, text="OCR")
+        notebook.add(tab_yolo, text="YOLO")
+        notebook.add(tab_cap, text="Capture")
+
+        self._build_hid_tab(tab_hid)
+        self._build_ocr_tab(tab_ocr)
+        self._build_yolo_tab(tab_yolo)
+        self._build_capture_tab(tab_cap)
+
+        bottom = ttk.Frame(self.root)
+        bottom.grid(row=2, column=0, sticky="nsew", **pad)
+        bottom.columnconfigure(0, weight=1)
+        bottom.rowconfigure(1, weight=1)
+
+        stop = tk.Button(
+            bottom, text="STOP (release all)", command=self.on_stop,
+            bg="#c0392b", fg="white", font=("", 11, "bold"),
+        )
+        stop.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+
+        logf = ttk.LabelFrame(bottom, text="Log")
+        logf.grid(row=1, column=0, sticky="nsew")
+        logf.columnconfigure(0, weight=1)
+        logf.rowconfigure(1, weight=1)
+
+        log_toolbar = ttk.Frame(logf)
+        log_toolbar.grid(row=0, column=0, columnspan=2, sticky="ew", padx=4, pady=(4, 0))
+        ttk.Button(log_toolbar, text="Clear", command=self.on_clear_log).pack(side="right")
+
+        log_scroll = ttk.Scrollbar(logf, orient="vertical")
+        log_scroll.grid(row=1, column=1, sticky="ns", pady=4, padx=(0, 4))
+        self.log = tk.Text(
+            logf, height=16, state="disabled", wrap="word",
+            yscrollcommand=log_scroll.set,
+        )
+        self.log.grid(row=1, column=0, sticky="nsew", padx=(4, 0), pady=4)
+        log_scroll.config(command=self.log.yview)
+
+    def _build_connection_bar(self, pad: dict) -> None:
         conn = ttk.LabelFrame(self.root, text="Connection")
-        conn.pack(fill="x", **pad)
+        conn.grid(row=0, column=0, sticky="ew", **pad)
+        conn.columnconfigure(1, weight=1)
 
         ttk.Label(conn, text="Port:").grid(row=0, column=0, sticky="e", padx=4, pady=4)
         self.port_var = tk.StringVar(value=find_port() or "")
@@ -81,15 +146,15 @@ class App:
         ttk.Label(conn, text="(blank = auto)").grid(row=0, column=5, sticky="w", padx=4)
 
         self.connect_btn = ttk.Button(conn, text="Connect", command=self.on_connect)
-        self.connect_btn.grid(row=1, column=0, columnspan=2, sticky="we", padx=4, pady=4)
+        self.connect_btn.grid(row=1, column=0, sticky="we", padx=4, pady=4)
         self.status_var = tk.StringVar(value="Not connected")
         ttk.Label(conn, textvariable=self.status_var, foreground="#a00").grid(
-            row=1, column=2, columnspan=4, sticky="w"
+            row=1, column=1, columnspan=5, sticky="w", padx=4
         )
 
-        # --- Mouse ---
-        mouse = ttk.LabelFrame(self.root, text="Mouse")
-        mouse.pack(fill="x", **pad)
+    def _build_hid_tab(self, parent: ttk.Frame) -> None:
+        mouse = ttk.LabelFrame(parent, text="Mouse")
+        mouse.pack(fill="x", pady=(0, 4))
 
         ttk.Label(mouse, text="X:").grid(row=0, column=0, sticky="e", padx=4, pady=4)
         self.x_var = tk.StringVar(value="960")
@@ -130,9 +195,8 @@ class App:
             row=3, column=2, columnspan=2, sticky="we", padx=4
         )
 
-        # --- Keyboard ---
-        kb = ttk.LabelFrame(self.root, text="Keyboard")
-        kb.pack(fill="x", **pad)
+        kb = ttk.LabelFrame(parent, text="Keyboard")
+        kb.pack(fill="x", pady=(0, 4))
 
         self.mod_ctrl = tk.BooleanVar()
         self.mod_shift = tk.BooleanVar()
@@ -159,12 +223,13 @@ class App:
             row=2, column=3, sticky="we", padx=4
         )
 
-        # --- Humanize tuning (live) ---
-        self._build_humanize_sliders()
+        self._build_humanize_sliders(parent)
 
-        # --- OCR ---
-        ocr = ttk.LabelFrame(self.root, text="OCR (region select)")
-        ocr.pack(fill="x", **pad)
+    def _build_ocr_tab(self, parent: ttk.Frame) -> None:
+        ocr = ttk.LabelFrame(parent, text="OCR (region select)")
+        ocr.pack(fill="x")
+        ocr.columnconfigure(1, weight=1)
+
         ttk.Button(ocr, text="Select Region", command=self.on_select_region).grid(
             row=0, column=0, sticky="we", padx=4, pady=4
         )
@@ -183,9 +248,46 @@ class App:
             row=1, column=2, sticky="we", padx=4
         )
 
-        # --- Dataset capture ---
-        cap = ttk.LabelFrame(self.root, text="Dataset capture (screenshots)")
-        cap.pack(fill="x", **pad)
+    def _build_yolo_tab(self, parent: ttk.Frame) -> None:
+        yolo = ttk.LabelFrame(parent, text="YOLO detection")
+        yolo.pack(fill="x")
+        yolo.columnconfigure(1, weight=1)
+
+        ttk.Label(yolo, text="Model:").grid(row=0, column=0, sticky="e", padx=4, pady=4)
+        self.yolo_model_var = tk.StringVar(value=DEFAULT_YOLO_MODEL)
+        ttk.Entry(yolo, textvariable=self.yolo_model_var).grid(
+            row=0, column=1, columnspan=2, sticky="we", padx=4
+        )
+        ttk.Button(yolo, text="Browse...", command=self.on_yolo_browse_model).grid(
+            row=0, column=3, sticky="we", padx=4
+        )
+
+        ttk.Button(yolo, text="Select Region", command=self.on_yolo_select_region).grid(
+            row=1, column=0, sticky="we", padx=4, pady=4
+        )
+        self.yolo_region_var = tk.StringVar(value="Region: full screen")
+        ttk.Label(yolo, textvariable=self.yolo_region_var).grid(
+            row=1, column=1, columnspan=2, sticky="w", padx=4
+        )
+        ttk.Button(yolo, text="Clear Region", command=self.on_yolo_clear_region).grid(
+            row=1, column=3, sticky="we", padx=4
+        )
+
+        ttk.Label(yolo, text="Conf:").grid(row=2, column=0, sticky="e", padx=4, pady=4)
+        self.yolo_conf_var = tk.StringVar(value="0.5")
+        ttk.Entry(yolo, textvariable=self.yolo_conf_var, width=8).grid(
+            row=2, column=1, sticky="w", padx=4
+        )
+        ttk.Button(yolo, text="Predict", command=self.on_yolo_predict).grid(
+            row=2, column=2, sticky="we", padx=4, pady=4
+        )
+        ttk.Button(yolo, text="Close Overlay", command=self.on_yolo_close_overlay).grid(
+            row=2, column=3, sticky="we", padx=4
+        )
+
+    def _build_capture_tab(self, parent: ttk.Frame) -> None:
+        cap = ttk.LabelFrame(parent, text="Dataset capture (screenshots)")
+        cap.pack(fill="x")
         cap.columnconfigure(1, weight=1)
 
         ttk.Label(cap, text="Save dir:").grid(row=0, column=0, sticky="e", padx=4, pady=4)
@@ -218,7 +320,6 @@ class App:
             row=2, column=2, columnspan=2, sticky="w", padx=4
         )
 
-        # Format / quality / resize: defaults tuned for YOLO datasets (small JPG).
         ttk.Label(cap, text="Format:").grid(row=3, column=0, sticky="e", padx=4, pady=4)
         self.cap_format_var = tk.StringVar(value="jpg")
         fmt_box = ttk.Combobox(
@@ -249,25 +350,18 @@ class App:
         )
         self.cap_stop_btn.grid(row=5, column=2, columnspan=2, sticky="we", padx=4)
 
-        # --- Panic ---
-        panic = ttk.Frame(self.root)
-        panic.pack(fill="x", **pad)
-        stop = tk.Button(
-            panic, text="STOP (release all)", command=self.on_stop,
-            bg="#c0392b", fg="white", font=("", 11, "bold"),
+        self.cap_manual_btn = ttk.Button(
+            cap, text="Manual capture", command=self.on_cap_manual
         )
-        stop.pack(fill="x")
-
-        # --- Log ---
-        logf = ttk.LabelFrame(self.root, text="Log")
-        logf.pack(fill="both", expand=True, **pad)
-        self.log = tk.Text(logf, height=10, state="disabled", wrap="word")
-        self.log.pack(fill="both", expand=True, padx=4, pady=4)
+        self.cap_manual_btn.grid(row=6, column=0, columnspan=2, sticky="we", padx=4, pady=4)
+        ttk.Label(cap, text="Hotkey: PrtSc").grid(
+            row=6, column=2, columnspan=2, sticky="w", padx=4
+        )
 
     # ----------------------------------------------------- humanize sliders
-    def _build_humanize_sliders(self) -> None:
-        frame = ttk.LabelFrame(self.root, text="Humanize tuning (applies live)")
-        frame.pack(fill="x", padx=6, pady=4)
+    def _build_humanize_sliders(self, parent) -> None:
+        frame = ttk.LabelFrame(parent, text="Humanize tuning (applies live)")
+        frame.pack(fill="x", pady=(0, 4))
         frame.columnconfigure(1, weight=1)
 
         # (label, attribute, min, max, integer?, value-format)
@@ -402,6 +496,137 @@ class App:
 
         self._enqueue(task)
 
+    # -------------------------------------------------------- YOLO detection
+    def on_yolo_browse_model(self) -> None:
+        initial = self.yolo_model_var.get().strip() or DEFAULT_YOLO_MODEL
+        initial_dir = str(Path(initial).parent) if Path(initial).parent.exists() else ""
+        chosen = filedialog.askopenfilename(
+            initialdir=initial_dir or None,
+            title="Select YOLO ONNX model",
+            filetypes=[("ONNX models", "*.onnx"), ("All files", "*.*")],
+        )
+        if chosen:
+            self.yolo_model_var.set(chosen)
+            self._yolo_detector = None
+            self._yolo_detector_path = None
+
+    def on_yolo_select_region(self) -> None:
+        def done(left: int, top: int, right: int, bottom: int) -> None:
+            self.yolo_region = (left, top, right, bottom)
+            self.yolo_region_var.set(f"Region: ({left},{top},{right},{bottom})")
+            self._log(f"[yolo] region set to {self.yolo_region}")
+
+        self._drag_region(done)
+
+    def on_yolo_clear_region(self) -> None:
+        self.yolo_region = None
+        self.yolo_region_var.set("Region: full screen")
+        self._log("[yolo] region cleared (full screen)")
+
+    def on_yolo_close_overlay(self) -> None:
+        if self._yolo_overlay is not None:
+            try:
+                self._yolo_overlay.destroy()
+            except tk.TclError:
+                pass
+            self._yolo_overlay = None
+
+    def _show_yolo_overlay(self, detections) -> None:
+        """Draw detection boxes on a fullscreen topmost overlay."""
+        self.on_yolo_close_overlay()
+
+        overlay = tk.Toplevel(self.root)
+        overlay.attributes("-fullscreen", True)
+        overlay.attributes("-alpha", 0.35)
+        overlay.attributes("-topmost", True)
+        overlay.configure(cursor="arrow", bg="black")
+        canvas = tk.Canvas(overlay, highlightthickness=0, bg="gray20")
+        canvas.pack(fill="both", expand=True)
+
+        for d in detections:
+            x1, y1, x2, y2 = d.box
+            canvas.create_rectangle(x1, y1, x2, y2, outline="#00ff00", width=2)
+            label = f"{d.label} {d.conf:.2f}"
+            canvas.create_text(
+                x1 + 2, max(y1 - 4, 0), text=label, anchor="sw",
+                fill="#00ff00", font=("", 10, "bold"),
+            )
+            canvas.create_oval(
+                d.x - 3, d.y - 3, d.x + 3, d.y + 3,
+                outline="#ff4444", fill="#ff4444",
+            )
+
+        def dismiss(_e: tk.Event | None = None) -> None:
+            self.on_yolo_close_overlay()
+
+        canvas.bind("<ButtonPress-1>", dismiss)
+        overlay.bind("<Escape>", dismiss)
+        overlay.focus_force()
+        self._yolo_overlay = overlay
+
+    def _get_yolo_detector(self, model_path: str):
+        from nge.detect import YoloDetector
+
+        if self._yolo_detector is None or self._yolo_detector_path != model_path:
+            self._log(f"[yolo] loading model: {model_path}")
+            self._yolo_detector = YoloDetector(model_path)
+            self._yolo_detector_path = model_path
+        return self._yolo_detector
+
+    def on_yolo_predict(self) -> None:
+        model_path = self.yolo_model_var.get().strip()
+        if not model_path:
+            self._log("[error] YOLO model path is empty")
+            return
+        if not Path(model_path).is_file():
+            self._log(f"[error] YOLO model not found: {model_path}")
+            return
+        try:
+            conf = float(self.yolo_conf_var.get())
+            if not 0.0 < conf <= 1.0:
+                raise ValueError
+        except ValueError:
+            self._log("[error] Conf must be a number between 0 and 1")
+            return
+
+        region = self.yolo_region
+
+        def task() -> None:
+            try:
+                if self._yolo_capture is None:
+                    from nge.capture import ScreenCapture
+
+                    self._yolo_capture = ScreenCapture()
+                frame = self._yolo_capture.grab()
+                if frame is None:
+                    self._log("[error] YOLO: no frame captured")
+                    return
+
+                detector = self._get_yolo_detector(model_path)
+                t0 = time.perf_counter()
+                dets = detector.detect(frame, region=region, conf=conf)
+                elapsed = time.perf_counter() - t0
+
+                print(f"[yolo] inference: {elapsed * 1000:.1f} ms, {len(dets)} detection(s)")
+                self._log(
+                    f"[yolo] inference: {elapsed * 1000:.1f} ms, {len(dets)} detection(s)"
+                )
+                if not dets:
+                    self._log("[yolo] no objects detected")
+                    return
+                for d in dets:
+                    msg = (
+                        f"[yolo] {d.label} conf={d.conf:.2f} "
+                        f"center=({d.x},{d.y}) box={d.box}"
+                    )
+                    print(msg)
+                    self._log(msg)
+                self.root.after(0, lambda: self._show_yolo_overlay(dets))
+            except Exception as exc:  # noqa: BLE001
+                self._log(f"[error] YOLO failed: {exc}")
+
+        self._enqueue(task)
+
     # -------------------------------------------------------- dataset capture
     def on_cap_browse(self) -> None:
         initial = self.cap_dir_var.get().strip() or DEFAULT_CAPTURE_DIR
@@ -422,6 +647,157 @@ class App:
         self.cap_region_var.set("Region: full screen")
         self._log("[capture] region cleared (full screen)")
 
+    def _read_cap_settings(self) -> dict | None:
+        """Parse dataset-capture UI fields (shared by auto and manual capture)."""
+        save_dir = Path(self.cap_dir_var.get().strip() or DEFAULT_CAPTURE_DIR)
+        try:
+            save_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"[error] cannot create save dir: {exc}")
+            return None
+
+        fmt = self.cap_format_var.get().strip().lower()
+        try:
+            quality = max(1, min(100, int(self.cap_quality_var.get())))
+        except ValueError:
+            self._log("[error] JPG quality must be an integer (1-100)")
+            return None
+        try:
+            max_w = max(0, int(self.cap_maxw_var.get()))
+        except ValueError:
+            self._log("[error] Max width must be an integer (0 = keep)")
+            return None
+
+        return {
+            "save_dir": save_dir,
+            "region": self.cap_region,
+            "fmt": fmt,
+            "quality": quality,
+            "max_w": max_w,
+        }
+
+    def _init_cap_capture(self) -> bool:
+        try:
+            if self._cap_capture is None:
+                from nge.capture import ScreenCapture
+
+                self._cap_capture = ScreenCapture()
+            return True
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"[error] capture init failed: {exc}")
+            return False
+
+    def _write_cap_frame(self, frame, settings: dict) -> Path | None:
+        import cv2
+
+        region = settings["region"]
+        max_w = settings["max_w"]
+        fmt = settings["fmt"]
+        quality = settings["quality"]
+        save_dir = settings["save_dir"]
+
+        if region is not None:
+            l, t, r, b = region
+            frame = frame[t:b, l:r]
+        if max_w and frame.shape[1] > max_w:
+            scale = max_w / frame.shape[1]
+            new_h = int(round(frame.shape[0] * scale))
+            frame = cv2.resize(frame, (max_w, new_h), interpolation=cv2.INTER_AREA)
+
+        ext = "jpg" if fmt == "jpg" else "png"
+        write_params = [cv2.IMWRITE_JPEG_QUALITY, quality] if ext == "jpg" else []
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        path = save_dir / f"shot_{ts}.{ext}"
+        if cv2.imwrite(str(path), frame, write_params):
+            return path
+        self._log(f"[error] imwrite failed: {path}")
+        return None
+
+    def _update_cap_status(self) -> None:
+        running = self._cap_thread is not None and self._cap_thread.is_alive()
+        prefix = "Running" if running else "Idle"
+        self.cap_status_var.set(f"{prefix} - {self._cap_count} saved")
+
+    def _capture_once(self) -> bool:
+        """Grab one frame and save using current dataset-capture settings."""
+        settings = self._read_cap_settings()
+        if settings is None:
+            return False
+        with self._cap_lock:
+            if not self._init_cap_capture():
+                return False
+            try:
+                frame = self._cap_capture.grab()
+                if frame is None:
+                    self._log("[capture] no frame, skipping")
+                    return False
+                path = self._write_cap_frame(frame, settings)
+                if path is None:
+                    return False
+                self._cap_count += 1
+                self.root.after(0, self._update_cap_status)
+                self._log(f"[capture] saved {path.name} (#{self._cap_count})")
+                return True
+            except Exception as exc:  # noqa: BLE001
+                self._log(f"[error] capture failed: {exc}")
+                return False
+
+    def on_cap_manual(self) -> None:
+        if self._cap_manual_busy:
+            return
+        self._cap_manual_busy = True
+
+        def work() -> None:
+            try:
+                self._capture_once()
+            finally:
+                self._cap_manual_busy = False
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _setup_prtsc_hotkey(self) -> None:
+        """Register PrtSc: global on Windows, window-local fallback elsewhere."""
+        self.root.bind("<Print>", lambda _e: self.on_cap_manual())
+        if sys.platform != "win32":
+            return
+        import ctypes
+        from ctypes import wintypes
+
+        self._user32 = ctypes.windll.user32
+        self._prtsc_hotkey_id = 1
+        hwnd = self.root.winfo_id()
+        # MOD_NOREPEAT: ignore auto-repeat while key is held.
+        ok = self._user32.RegisterHotKey(hwnd, self._prtsc_hotkey_id, 0x4000, 0x2C)
+        if not ok:
+            self._log("[capture] global PrtSc unavailable; use button or focus window + PrtSc")
+            return
+        self._prtsc_msg = wintypes.MSG()
+        self._log("[capture] PrtSc hotkey registered (global)")
+
+        def poll() -> None:
+            if not getattr(self, "_user32", None):
+                return
+            pm_remove = 0x0001
+            while self._user32.PeekMessageW(
+                ctypes.byref(self._prtsc_msg), None, 0x0312, 0x0312, pm_remove
+            ):
+                if self._prtsc_msg.wParam == self._prtsc_hotkey_id:
+                    self.on_cap_manual()
+            self.root.after(50, poll)
+
+        self.root.after(50, poll)
+        self.root.bind("<Destroy>", self._unregister_prtsc_hotkey, add="+")
+
+    def _unregister_prtsc_hotkey(self, _event: tk.Event | None = None) -> None:
+        if sys.platform != "win32" or not getattr(self, "_user32", None):
+            return
+        try:
+            hwnd = self.root.winfo_id()
+            self._user32.UnregisterHotKey(hwnd, self._prtsc_hotkey_id)
+        except tk.TclError:
+            pass
+        self._user32 = None
+
     def on_cap_start(self) -> None:
         if self._cap_thread is not None and self._cap_thread.is_alive():
             self._log("[capture] already running")
@@ -433,39 +809,25 @@ class App:
         except ValueError:
             self._log("[error] Interval must be a positive number")
             return
-        save_dir = Path(self.cap_dir_var.get().strip() or DEFAULT_CAPTURE_DIR)
-        try:
-            save_dir.mkdir(parents=True, exist_ok=True)
-        except Exception as exc:  # noqa: BLE001
-            self._log(f"[error] cannot create save dir: {exc}")
+        settings = self._read_cap_settings()
+        if settings is None:
             return
 
-        fmt = self.cap_format_var.get().strip().lower()
-        try:
-            quality = max(1, min(100, int(self.cap_quality_var.get())))
-        except ValueError:
-            self._log("[error] JPG quality must be an integer (1-100)")
-            return
-        try:
-            max_w = max(0, int(self.cap_maxw_var.get()))
-        except ValueError:
-            self._log("[error] Max width must be an integer (0 = keep)")
-            return
-
-        region = self.cap_region
         self._cap_count = 0
         self._cap_stop.clear()
         self._cap_thread = threading.Thread(
             target=self._capture_loop,
-            args=(save_dir, region, interval, fmt, quality, max_w),
+            args=(interval, settings),
             daemon=True,
         )
         self._cap_thread.start()
         self.cap_start_btn.config(state="disabled")
         self.cap_stop_btn.config(state="normal")
+        s = settings
         self._log(
-            f"[capture] started -> {save_dir} (every {interval:g}s, region={region}, "
-            f"{fmt}{'/q'+str(quality) if fmt == 'jpg' else ''}, max_w={max_w or 'keep'})"
+            f"[capture] started -> {s['save_dir']} (every {interval:g}s, region={s['region']}, "
+            f"{s['fmt']}{'/q'+str(s['quality']) if s['fmt'] == 'jpg' else ''}, "
+            f"max_w={s['max_w'] or 'keep'})"
         )
 
     def on_cap_stop(self) -> None:
@@ -474,59 +836,36 @@ class App:
         self.cap_stop_btn.config(state="disabled")
         self._log(f"[capture] stopped - {self._cap_count} image(s) saved")
 
-    def _capture_loop(
-        self, save_dir: Path, region, interval: float,
-        fmt: str, quality: int, max_w: int,
-    ) -> None:
-        try:
-            import cv2
-
-            if self._cap_capture is None:
-                from nge.capture import ScreenCapture
-
-                self._cap_capture = ScreenCapture()
-        except Exception as exc:  # noqa: BLE001
-            self._log(f"[error] capture init failed: {exc}")
+    def _capture_loop(self, interval: float, settings: dict) -> None:
+        if not self._init_cap_capture():
             self.root.after(0, self.on_cap_stop)
             return
 
-        ext = "jpg" if fmt == "jpg" else "png"
-        write_params = [cv2.IMWRITE_JPEG_QUALITY, quality] if ext == "jpg" else []
-
         while not self._cap_stop.is_set():
             start = time.monotonic()
-            try:
-                frame = self._cap_capture.grab()
-                if frame is None:
-                    self._log("[capture] no frame, skipping")
-                else:
-                    if region is not None:
-                        l, t, r, b = region
-                        frame = frame[t:b, l:r]
-                    if max_w and frame.shape[1] > max_w:
-                        scale = max_w / frame.shape[1]
-                        new_h = int(round(frame.shape[0] * scale))
-                        frame = cv2.resize(
-                            frame, (max_w, new_h), interpolation=cv2.INTER_AREA
-                        )
-                    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-                    path = save_dir / f"shot_{ts}.{ext}"
-                    if cv2.imwrite(str(path), frame, write_params):
-                        self._cap_count += 1
-                        self.cap_status_var.set(f"Running - {self._cap_count} saved")
-                    else:
-                        self._log(f"[error] imwrite failed: {path}")
-            except Exception as exc:  # noqa: BLE001
-                self._log(f"[error] capture failed: {exc}")
-            # Sleep the remaining interval, but stay responsive to Stop.
+            # Re-read UI each shot so manual tweaks apply without restarting.
+            live = self._read_cap_settings()
+            if live is not None:
+                settings = live
+            self._capture_once()
             elapsed = time.monotonic() - start
             self._cap_stop.wait(max(0.0, interval - elapsed))
 
-        self.cap_status_var.set(f"Idle - {self._cap_count} saved")
+        self.root.after(0, self._update_cap_status)
 
     # -------------------------------------------------------------- helpers
     def _log(self, msg: str) -> None:
         self.log_q.put(msg)
+
+    def on_clear_log(self) -> None:
+        while True:
+            try:
+                self.log_q.get_nowait()
+            except queue.Empty:
+                break
+        self.log.configure(state="normal")
+        self.log.delete("1.0", "end")
+        self.log.configure(state="disabled")
 
     def _drain_log(self) -> None:
         try:

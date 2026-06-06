@@ -9,7 +9,8 @@ device firmware.
 from __future__ import annotations
 
 from .controller import Controller
-from .humanize import HumanizeConfig, generate_path
+from .humanize import HumanizeConfig, generate_path, random_delay
+from .logger import get_logger, logger, print
 from .transport import SerialTransport, TransportError, find_port
 
 __all__ = [
@@ -19,6 +20,10 @@ __all__ = [
     "find_port",
     "HumanizeConfig",
     "generate_path",
+    "random_delay",
+    "get_logger",
+    "logger",
+    "print",
 ]
 
 __version__ = "0.1.0"

@@ -1,5 +1,5 @@
 # Python mouse and keyboard control methods
-_Exported on 2026/6/2 at GMT+8 1:22:51 from Cursor (3.5.33)_
+_Exported on 2026/6/3 at GMT+8 23:35:28 from Cursor (3.5.33)_
 
 ---
 
@@ -3048,4 +3048,660 @@ Now update the TOC, project structure, and examples table.
 - **示例脚本表**：新增 `detect_example.py` 一行。
 
 > 提示：README 顶部「目录」是手写锚点列表，我没硬塞「YOLO 目标检测」独立条目（它作为「Python API 速览」的子节存在，和 OCR、bot 一样）。如果你想让它在目录里单独成项，我可以再加一行锚点链接。
+
+---
+
+**User**
+
+onnxruntime跑YOLO推理不常驻PyTorch，和使用PyTorch有什么区别
+
+---
+
+**Cursor**
+
+好问题。两条路线推理结果几乎一样（同一个模型权重），区别主要在**工程层面**：依赖、体积、启动、内存、速度、灵活性。下面逐项说。
+
+## 核心区别一览
+
+| 维度 | onnxruntime（方式 B） | PyTorch / ultralytics（方式 A） |
+|------|----------------------|-------------------------------|
+| 运行时依赖 | `onnxruntime` 一个包（RapidOCR 已带） | `torch` + `torchvision` + `ultralytics` 全家桶 |
+| 安装体积 | CPU 版约 **50–100 MB** | CPU 版约 **800MB–1.5GB**，GPU(CUDA) 版 **2–5GB** |
+| 进程内存 | 小（只加载 ORT + 模型） | 大（torch 框架本身就吃几百 MB） |
+| 冷启动 | 快（秒级加载 session） | 慢（import torch + 建图就要数秒） |
+| 推理速度 | CPU 上通常**更快**（图优化、算子融合） | GPU 上差距不大；CPU 偏慢 |
+| 改模型结构 | 不行（计算图已固化） | 能改、能继续训练、能做后处理实验 |
+| 训练 | **不支持** | 支持（训练就得用它） |
+| 部署/分发 | 简单，跨平台一个 `.onnx` | 重，环境易冲突 |
+
+## 为什么 onnxruntime 更"轻"
+
+- **导出即固化**：`yolo export format=onnx` 把网络结构 + 权重冻结成一张静态计算图。推理时 ORT 只是"按图执行"，不需要 PyTorch 的动态图引擎、autograd、训练相关的一切。
+- **专做推理的优化**：ORT 加载时会做**常量折叠、算子融合、内存复用**等图优化，CPU 上通常比 PyTorch eager 模式快一截。
+- **你的项目本来就装了它**：RapidOCR 依赖 `onnxruntime`，复用同一个运行时，不额外引入 GB 级的 torch。
+
+## 两者在你这个项目里的实际差异
+
+1. **环境干净**：不装 torch，就不会出现之前那种 `paddlepaddle`/`Pillow` 版本冲突的连锁问题。CUDA 版 torch 还要严格匹配显卡驱动/CUDA 版本，很折腾。
+2. **bot 启动更快、占用更低**：自动化脚本经常反复启停，ORT 冷启动快这点体感明显。
+3. **代价是损失灵活性**：
+   - 不能在运行时改网络、不能继续训练（这些本来就该在训练阶段用 ultralytics 做完）。
+   - 后处理（解析输出、NMS）要**自己写**——这正是 `nge/detect.py` 里 letterbox / 解析 `[1,4+nc,anchors]` / `cv2.dnn.NMSBoxes` 那段。ultralytics 则把这些都封装好了，`results = model(img)` 一行出框。
+
+## GPU 这一点要单独说
+
+- 想让 ORT 用 GPU，要装 **`onnxruntime-gpu`**（不是 `onnxruntime`），并配好 CUDA/cuDNN。`detect.py` 里已经写了 provider 自适配：装了 GPU 版且环境就绪就走 `CUDAExecutionProvider`，否则自动回退 CPU。
+- 纯推理、batch=1 的场景，**CPU 版 ORT 对 YOLO11n/s 这种小模型通常够用**（几十 ms 一帧），不一定非上 GPU。
+
+## 一句话结论
+
+- **训练/调模型** → 必须 PyTorch + ultralytics。
+- **线上跑推理** → 导出 ONNX 用 onnxruntime，更轻、更快、依赖更干净，代价是后处理自己写、不能改图。
+
+你这套 bot 的定位就是"训练在别处做完，运行时只推理"，所以方式 B 是更合适的选择。需要的话我可以再给一个**精度/速度对照的小基准脚本**，让你拿自己的 `.onnx` 实测 ORT-CPU 和 ultralytics 的差异。
+
+---
+
+**User**
+
+@detect.py 在初始化时打印当前使用的是GPU模式还是CPU模式
+
+---
+
+**Cursor**
+
+I'll check the current logging in `_ensure` and make it clearly print GPU vs CPU mode.
+
+I'll make it report the actual active provider (GPU vs CPU) clearly, reading from the created session rather than the requested list.
+
+Let me verify the logger actually outputs at info level so the user sees it.
+
+已改好。`_ensure()` 现在会读取**实际生效的 provider**（不是请求的那个），因为请求 CUDA 但环境不全时 onnxruntime 会静默回退到 CPU——读 `get_providers()[0]` 才是真实状态。
+
+初始化（懒加载，首次 `detect`/`find` 时触发）会打印类似：
+
+```
+19:08:01 INFO    nge.detect: YOLO detector ready [GPU mode] (provider=CUDAExecutionProvider, input=640, 3 classes)
+```
+
+或 CPU 时：
+
+```
+19:08:01 INFO    nge.detect: YOLO detector ready [CPU mode] (provider=CPUExecutionProvider, input=640, 3 classes)
+```
+
+日志走 `nge` logger，默认 `INFO` 级别会输出到控制台（可用环境变量 `NGE_LOG_LEVEL` 调整）。`[GPU mode]`/`[CPU mode]` 一眼能看出当前模式。
+
+> 注：要真正跑 GPU 需装 `onnxruntime-gpu` 并配好 CUDA/cuDNN；只装了 `onnxruntime` 时这里始终显示 `[CPU mode]`。
+
+---
+
+**User**
+
+有没有一站式平台集成图片采集、标注、训练、推理的平台
+
+---
+
+**Cursor**
+
+有，主流的一站式（采集→标注→训练→推理/导出）平台不少。结合你的需求（YOLO 目标检测 + 导出 ONNX 给 bot 用），我按"云端一站式 / 自托管开源 / 大厂 AutoML"分三类推荐。
+
+## 一、云端一站式（最省事，首推）
+
+| 平台 | 标注 | 训练 | 导出 ONNX | 推理API | 免费额度 | 备注 |
+|------|------|------|-----------|---------|----------|------|
+| **Roboflow** | ✅强 | ✅一键 | ✅ | ✅ | 有（公开项目免费） | **综合最完善**，支持数据增强、版本管理、模型辅助标注 |
+| **Ultralytics HUB** | 一般 | ✅原生 YOLO11 | ✅ | ✅ | 有 | YOLO 官方出品，和你用的 `ultralytics` **无缝衔接** |
+| **Datature Nexus** | ✅强 | ✅ | ✅ | ✅ | 有 | MLOps 完整，团队协作好 |
+
+**对你最合适：Roboflow + Ultralytics HUB**
+- 用 Roboflow 标注 + 数据增强 + 管理版本，导出 YOLO 格式；
+- 训练既可在 Roboflow 一键训，也可下载数据集本地 `yolo train`，或丢 Ultralytics HUB 训；
+- 最后 `export format=onnx`，拿到 `.onnx` 直接喂你的 `nge/detect.py`。
+
+## 二、自托管 / 开源（数据敏感、想离线、免费）
+
+| 工具 | 定位 | 训练 |
+|------|------|------|
+| **CVAT** | 专业标注（Intel 开源），支持视频抽帧、模型辅助 | ❌（配合本地 ultralytics 训） |
+| **Label Studio** | 通用标注，支持 **ML 后端**做模型辅助标注/主动学习 | 半自动（接后端） |
+| **X-AnyLabeling** | 本地标注工具，内置 SAM/YOLO 辅助，直接出 YOLO 格式 | ❌ |
+
+这类纯做"采集+标注"，**训练用本地 `ultralytics`**，导出 ONNX。适合不想把游戏截图传到云上的情况。
+
+## 三、大厂 AutoML（全托管，但导出受限）
+
+- **Google Vertex AI / AutoML Vision**、**Azure Custom Vision**、**AWS Rekognition Custom Labels**：上传→标注→训练→部署 API 全包，无代码。
+- ⚠️ **缺点**：多数**绑定云推理 API**，ONNX 导出受限或不支持。你要的是本地 onnxruntime 跑，**不太适合**，除非接受走云 API。
+
+## 针对你这套 bot 的推荐工作流
+
+1. **采集**：直接用项目里的 `nge.capture.ScreenCapture` 定时存游戏截图（你已经有截屏能力，比手动截图高效）。
+
+```python
+from nge.capture import ScreenCapture
+import cv2, time
+cap = ScreenCapture()
+for i in range(500):
+    cv2.imwrite(f"dataset/raw/{i:04d}.png", cap.grab())
+    time.sleep(0.5)
+```
+
+2. **标注**：上传到 **Roboflow**（或本地用 **X-AnyLabeling**，带 SAM 半自动框，标怪物/掉落物快）。
+3. **训练**：Roboflow 一键，或下载数据集本地 `yolo detect train model=yolo11n.pt`。
+4. **导出**：`yolo export format=onnx` → 得到 `best.onnx`。
+5. **推理**：丢进 `YoloDetector(r"...best.onnx")`，bot 里 `ctx.find_object("monster")`。
+
+## 一句话结论
+
+- **想最快上手、一个平台全搞定** → **Roboflow**。
+- **想和现有 `ultralytics` 流程最顺** → **Ultralytics HUB**。
+- **数据不出本机** → **X-AnyLabeling/CVAT 标注 + 本地训练**。
+
+要的话我可以帮你写一个**数据采集脚本**（带去重/定时/按键触发截图），直接生成可上传 Roboflow 的图片集。
+
+---
+
+**User**
+
+Roboflow是网页版还是客户端，如何使用Roboflow
+
+---
+
+**Cursor**
+
+Roboflow 是**纯网页版（SaaS）**，浏览器打开 [roboflow.com](https://roboflow.com) 注册即用，没有必须安装的桌面客户端。它额外提供 **Python SDK / CLI / 推理 API**（`pip install roboflow`），但那是给程序调用的，标注训练全在网页上做。
+
+## 是否要装东西
+
+| 用途 | 方式 |
+|------|------|
+| 标注 / 训练 / 管理数据集 | **网页端**，零安装 |
+| 下载数据集到本地训练 | `pip install roboflow`（SDK）或网页直接下 zip |
+| 程序里调云端推理 | `pip install inference` / API key |
+
+对你的流程（本地 onnxruntime 跑），**只用网页端标注+导出数据集**即可，SDK 可选。
+
+## 使用步骤（结合你的 bot）
+
+### 1. 注册 + 建项目
+- 打开 [app.roboflow.com](https://app.roboflow.com)，用 Google/邮箱注册。
+- `Create Project` → 类型选 **Object Detection** → 填项目名、标注对象名（如 `monster`/`loot`）。
+
+### 2. 上传图片（你的游戏截图）
+- 用项目里的 `ScreenCapture` 先批量存图（前面给过脚本），把 `dataset/raw/*.png` 拖进网页 `Upload` 区。
+- 建议先传 **100–300 张**覆盖不同场景/光照/怪物形态。
+
+### 3. 标注
+- 网页内置标注器：拖框框住目标，选类别。
+- 可开 **Label Assist / Auto Label**（用已有模型或 SAM 辅助框），标得更快。
+- 分配 `Train/Valid/Test`（默认 70/20/10 即可）。
+
+### 4. 生成版本 + 数据增强
+- `Generate` → 加 **Preprocessing**（Resize 到 640×640）和 **Augmentation**（翻转、亮度、模糊等，扩充样本）。
+- 点 `Create` 生成一个带版本号的数据集。
+
+### 5. 训练（两选一）
+
+**A. 本地训练（推荐，配合你现有 ultralytics）**
+- 在版本页点 `Download Dataset` → 格式选 **YOLOv8/YOLO11 (PyTorch)** → 复制给的代码片段，或直接下 zip。
+
+```powershell
+pip install roboflow ultralytics
+```
+```python
+from roboflow import Roboflow
+rf = Roboflow(api_key="你的KEY")
+ds = rf.workspace("ws").project("proj").version(1).download("yolov8")
+```
+```powershell
+yolo detect train data=路径/data.yaml model=yolo11n.pt epochs=100 imgsz=640
+yolo export model=runs/detect/train/weights/best.pt format=onnx
+```
+
+**B. 云端一键训练（Roboflow Train）**
+- 版本页点 `Train`，选 Roboflow 训练（消耗额度/积分）。训完可下载权重，再本地导出 ONNX。
+
+### 6. 用到 bot
+- 拿到 `best.onnx` → `YoloDetector(r"...\best.onnx")`，bot 里 `ctx.find_object("monster")`。
+
+## 几个注意点
+
+- **免费版项目默认是 Public**（数据公开可被检索）。游戏截图若不想公开，需付费 Private，或改用本地 **X-AnyLabeling/CVAT** 标注。
+- ONNX 导出由 `ultralytics` 的 `export` 完成，**Roboflow 主要负责数据侧**，模型导出建议本地做（方式 A 流程）。
+- 类别名会写进 `data.yaml`，训练后内嵌进 ONNX 元数据，`nge/detect.py` 会自动读出来。
+
+需要的话，我把"截图采集脚本"完善成**带去重和热键触发**的版本，让你采数据时只在合适画面按一下键就存图，标注量更省。
+
+---
+
+**User**
+
+暗黑4的公开数据集可以在哪些地方下载到
+
+---
+
+**Cursor**
+
+先说实话：**暗黑4（Diablo 4）几乎没有现成、可直接用于目标检测的公开标注数据集**。它不是学术常见对象（不像 COCO 的人/车），社区也很少有人公开标注好的怪物/掉落物数据集。我帮你确认一下当前公开平台的实际情况。
+
+查到了。结论：**确实有少量社区数据集，但都很小、质量参差，没有权威/大规模的官方公开集**。主要集中在 **Roboflow Universe**。下面是实际找到的资源。
+
+## Roboflow Universe（主要来源）
+
+社区在这里发了几个暗黑相关的检测项目，可在线用或下载（YOLO 格式）：
+
+| 项目 | 内容 | 规模 | 链接 |
+|------|------|------|------|
+| **Diablo 4**（diablo-4-fojil） | 怪物 / 障碍 / 物品 3 类检测 | 中等 | [universe.roboflow.com/diablo-4-fojil/diablo-4](https://universe.roboflow.com/diablo-4-fojil/diablo-4) |
+| **diablo-4-monster-dataset / dataset2** | 怪物 | 91 / 50 张（很小） | [project-rx0vo](https://universe.roboflow.com/project-rx0vo) |
+| **Diablo bot**（YOLOv11） | 通用 bot 检测，有预训练模型 | — | [bot-3fkws/diablo-bot-ydocl](https://universe.roboflow.com/bot-3fkws/diablo-bot-ydocl/model/3) |
+| **D2R / DiabloBot**（暗黑2重制） | NPC/怪/物品（Deckard Cain、Diablo 等） | 1.4k 张 | [diablo2-okuos/d2r](https://universe.roboflow.com/diablo2-okuos/d2r-fxcz1-o9un2) |
+
+> 搜索入口：[universe.roboflow.com](https://universe.roboflow.com) 搜 `Diablo 4` / `Diablo` / `D4`。注意暗黑2的数据集**不能直接用于暗黑4**（美术风格、怪物完全不同）。
+
+## 怎么下载/用
+
+在某个项目页点 **Download Dataset** → 选 **YOLOv8/YOLO11 (PyTorch)** 格式，或用 SDK：
+
+```python
+from roboflow import Roboflow
+rf = Roboflow(api_key="你的KEY")
+ds = rf.workspace("diablo-4-fojil").project("diablo-4").version(1).download("yolov8")
+# 得到 data.yaml + images/ + labels/，可直接 yolo train
+```
+
+## 其他平台现状
+
+- **Kaggle / Hugging Face**：搜过，**没有**专门的 D4 目标检测标注集。
+- **GitHub**：有相关项目但多是 OCR/工具，比如 [mxtsdev/d4-item-tooltip-ocr](https://github.com/mxtsdev/d4-item-tooltip-ocr)（D4 物品 tooltip 的 OCR，用的 PaddleOCR + 自训模型）——这对你做**物品文字识别**有参考价值，但不是检测框数据集。
+
+## 实话与建议
+
+1. **现成集只够"起步/试跑"**：几十到几百张、类别少、未必覆盖你的职业/分辨率/画面设置，直接拿来用精度通常一般。
+2. **最佳实践是"借 + 补"**：
+   - 先下 Roboflow 上的 D4 集做**预训练/迁移起点**；
+   - 再用你自己的 `ScreenCapture` 采你**实际游戏画面**（你的分辨率、UI、常打的怪），补标 100–300 张，合并训练。这样模型最贴合你的环境。
+3. **版权/合规**：这些社区数据来自玩家截图，仅适合个人学习；别用于商业或公开分发。
+
+要不要我帮你写一个**数据采集脚本**（热键触发 + 自动去重 + 按时间戳命名），方便你快速攒自己的 D4 截图去补标？这是提升精度最实在的一步。
+
+---
+
+**User**
+
+当前项目的OCR使用的GPU还是CPU，在初始化时打印当前使用的模式
+
+---
+
+**Cursor**
+
+I'll check how the OCR engine is initialized to see whether it uses GPU/CPU and where to add the log.
+
+`rapidocr-onnxruntime` 默认在 **CPU** 上跑（除非装了 `onnxruntime-gpu` 且显式开 `use_cuda`）。我让初始化时去读它内部识别模型 session 实际生效的 provider 来打印真实模式。
+
+Now add the `_active_provider` helper that defensively digs into RapidOCR's internal onnxruntime session.
+
+Let me verify it works against the actually installed RapidOCR.
+
+实测通过。OCR 初始化（懒加载，首次调用时触发）现在会打印真实模式：
+
+```
+19:29:48 INFO    nge.ocr: OCR engine ready (RapidOCR) [CPU mode] (provider=CPUExecutionProvider)
+```
+
+## 改动说明
+
+- 新增 `_active_provider()`：防御式地读 RapidOCR 内部 det/cls/rec 模型的 onnxruntime session，取实际生效的 provider（不同版本属性名有差异，已做兼容和异常兜底）。
+- `_ensure()` 里据此判断 `[GPU mode]`/`[CPU mode]` 并打印，和 `detect.py` 的风格一致。
+
+## 你这套当前的实际情况
+
+你装的是 `rapidocr-onnxruntime`，它依赖**纯 CPU 版 `onnxruntime`**，所以现在就是 **CPU mode**——这也是查到的结果。
+
+想让 OCR 走 GPU 需要两步（一般没必要，OCR 在 CPU 上已经很快）：
+1. 装 GPU 版运行时：`pip install onnxruntime-gpu`（并配好 CUDA/cuDNN）；
+2. 创建时开 CUDA，例如 `OCREngine(engine_kwargs={"det_use_cuda": True, "cls_use_cuda": True, "rec_use_cuda": True})`（具体键名看你的 RapidOCR 版本）。
+
+> 顺带一致性提醒：`detect.py` 的 YOLO 检测同理，只有装了 `onnxruntime-gpu` 才可能显示 `[GPU mode]`。两个模块现在打印格式统一，方便排查。
+
+---
+
+**User**
+
+说明ocr和yolo使用cpu和gpu模式的优缺点
+
+---
+
+**Cursor**
+
+结合你这套 bot 的实际场景（单帧推理、实时性、反检测要求），分 OCR 和 YOLO 两块说 CPU/GPU 的优缺点。
+
+## 一、共性原理
+
+- **GPU 擅长大规模并行**：图像卷积是天然并行任务，模型越大、输入分辨率越高、batch 越大，GPU 优势越明显。
+- **GPU 有固定开销**：显存占用、数据 CPU↔GPU 拷贝延迟、CUDA 初始化耗时。小模型/单张图时，这些开销可能把"算得快"的收益吃掉。
+
+## 二、OCR（RapidOCR / PP-OCR）
+
+OCR 模型很小，且你只识别**小区域**（血量、金币、提示条）。
+
+| | CPU | GPU |
+|---|---|---|
+| 速度 | 小区域几十 ms，**足够实时** | 单张提升有限，反而受拷贝开销影响 |
+| 安装 | `rapidocr-onnxruntime` 开箱即用 | 要装 `onnxruntime-gpu`+CUDA，还要改 `use_cuda` 配置 |
+| 显存 | 不占 | 占一份，和 YOLO 抢显存 |
+| 稳定性 | 高 | 受驱动/CUDA 版本影响 |
+
+**结论：OCR 用 CPU 就好。** 上 GPU 性价比极低，除非你要一次性 OCR 整屏大图或做高频全屏文字扫描——但那本身就是错误用法（应该先框 region）。
+
+## 三、YOLO 目标检测
+
+取决于**模型大小**和**调用频率**。
+
+| | CPU | GPU |
+|---|---|---|
+| 小模型(YOLO11n/s) 单帧 | 约 **20–60 ms**，多数 bot 够用 | 5–15 ms，但有拷贝/初始化开销 |
+| 大模型(m/l/x) 或高分辨率 | 明显变慢，**几百 ms 卡顿** | 优势大，能稳定实时 |
+| 高频调用(每秒多次/整屏) | 吃满 CPU，影响游戏帧率 | 流畅，且不抢 CPU |
+| 安装/依赖 | 轻，`onnxruntime` 即可 | 重，`onnxruntime-gpu`+CUDA/cuDNN，版本要匹配 |
+| 显存 | 0 | 占几百 MB~GB |
+| 与游戏争资源 | **争 CPU** | **争 GPU/显存**（游戏本身也吃显存） |
+
+**结论：**
+- **YOLO11n/s + 区域裁剪 + 低频调用（如每 0.2–0.5s 一次）→ CPU 足够**，依赖干净、不抢显存。
+- **大模型 / 整屏检测 / 高频实时 → 上 GPU**。
+- 注意游戏本身吃显存，YOLO 上 GPU 要留意**显存争用**可能让游戏掉帧。
+
+## 四、给你这套 bot 的实操建议
+
+1. **默认全 CPU 起步**：OCR + YOLO11n + 都传 `region`，先跑通。CPU 单帧通常能压到 bot 的 tick 间隔内。
+2. **先靠"提速三件套"而不是急着上 GPU**：
+   - **region 裁剪**（最有效，输入像素少几十倍）；
+   - **降低调用频率**（YOLO 不必每帧跑，`cooldown`/降 tick）；
+   - **选小模型**（n/s 优先）。
+3. **真不够再上 GPU，且只给 YOLO 上**：装 `onnxruntime-gpu`，`detect.py` 的 provider 自适配会自动走 CUDA；OCR 继续留 CPU，避免无谓显存占用。
+4. **反检测角度**：CPU/GPU 不影响被检测与否（推理在你本机，跟游戏客户端无关）。但**别为了追求速度把检测频率拉太高**——固定高频、零延迟反应反而是行为层面的可疑特征。适当留随机间隔更"像人"。
+
+一句话：**OCR 一律 CPU；YOLO 默认 CPU + region + 低频，扛不住再单独给 GPU。**
+
+---
+
+**User**
+
+将使用 ScreenCapture 采实际游戏画面的功能加入 @gui_test.py ，可以自定义截图文件保存路径，截屏区域设置，截屏时间间隔，开始和终止按钮，其中截屏文件保存路径、截屏区域、时间间隔都有默认值
+
+---
+
+**Cursor**
+
+I'll read the GUI test file to understand its structure before adding the screenshot capture feature.
+
+I'll add a "Dataset capture" section. First, let me refactor the region-select overlay into a reusable helper so both OCR and capture can use it.
+
+Now refactor the region overlay into a reusable helper and update OCR's `on_select_region` to use it.
+
+Now add the Dataset capture UI section, after the OCR section.
+
+Now add the handler methods. I'll place them after `on_ocr_read`.
+
+Now bump the window size to fit the new section.
+
+Let me do a syntax/compile check.
+
+已在 `gui_test.py` 加入"数据集采集（截图）"模块，编译通过、无 lint 错误。
+
+## 新增「Dataset capture (screenshots)」面板
+
+| 控件 | 说明 | 默认值 |
+|------|------|--------|
+| **Save dir** + `Browse...` | 自定义保存路径，按钮弹文件夹选择 | `<仓库根>/captures` |
+| **Select Region / Clear Region** | 框选截屏区域 / 清除回全屏 | 全屏 |
+| **Interval (s)** | 截屏时间间隔（秒，支持小数） | `1.0` |
+| **Start / Stop** | 开始/终止采集 | — |
+| 状态标签 | 实时显示运行状态与已保存张数 | `Idle - 0 saved` |
+
+## 实现要点
+
+- **独立线程**：采集跑在专属线程（`_capture_loop`），不占用串口 worker 队列，截图和键鼠操作互不阻塞。
+- **专属截图器**：用单独的 `ScreenCapture` 实例（懒加载），与 OCR 的截图器互不干扰。
+- **区域裁剪**：设了 region 就对帧做切片只存该区域，否则存全屏。
+- **文件名**：`shot_YYYYmmdd_HHMMSS_fff.png`（毫秒级时间戳，天然去重不覆盖）。
+- **精准间隔**：用 `time.monotonic()` 扣除处理耗时后再 `wait` 剩余时间，且 `wait` 监听停止事件，**点 Stop 能立即响应**（不用等满一个间隔）。
+- **复用框选**：把原来 OCR 的全屏框选重构成通用 `_drag_region(on_done)`，OCR 和采集共用同一套覆盖层逻辑。
+- 保存用 `cv2.imwrite`，截屏帧是 BGR，存出来颜色正确。
+
+## 用法
+
+```powershell
+python -m examples.gui_test
+```
+
+在「Dataset capture」里：选保存目录 → （可选）框选只采游戏画面区域 → 设间隔 → **Start** 开始攒图，**Stop** 结束。状态行会实时显示已存张数。攒够后直接上传 Roboflow 标注即可。
+
+> 提示：采集不需要连接 ESP32（截屏是被动的），可独立使用。想边玩边采时把间隔设大一点（如 1–2s）避免重复帧太多。
+
+---
+
+**User**
+
+我目前的屏幕尺寸为2560*1440，截的游戏截图每张图在5MB左右，这对于yolo训练是否太大了
+
+---
+
+**Cursor**
+
+结论：**5MB 的图本身不会让 YOLO 训不了，但确实偏大、没必要**。问题不在"分辨率太高 YOLO 受不了"，而在**存储/加载浪费**和**小目标可能丢失**这两点。
+
+## 关键认知：YOLO 训练时会自动缩放
+
+YOLO 训练有个 `imgsz` 参数（默认 **640**）。无论你喂多大的图，它都会在训练时**自动 letterbox 缩放到 640×640**。所以：
+
+- 2560×1440 → 训练时实际被缩到 640，**多出来的像素在默认设置下没用上**。
+- 你存 5MB 的无损 PNG，绝大部分信息训练时直接被丢弃了 → **纯浪费磁盘和 I/O**。
+
+## 5MB 大在哪：是 PNG 不是分辨率
+
+- 你现在存的是 **PNG（无损）**，2560×1440 无损就是 3–6MB。
+- 数据集**根本不需要无损**，**改存 JPG** 立刻降一个数量级：
+
+| 格式/尺寸 | 单张大小（约） |
+|-----------|----------------|
+| PNG 2560×1440（当前） | 3–6 MB |
+| JPG q90 2560×1440 | 0.5–1 MB |
+| JPG q90 缩到 1280×720 | 150–300 KB |
+
+1000 张：PNG 约 **5GB** → JPG 约 **0.5GB** → 缩放后 JPG **约 200MB**。差距巨大，且训练精度几乎无损。
+
+## 该怎么做（推荐顺序）
+
+1. **改存 JPG**（最省事、收益最大）。数据集业界标准就是 JPG。
+2. **可选缩放到 1280 宽**：再省一半多空间，标注工具也加载更快。Roboflow 上传后也会按需 resize。
+3. **只采游戏画面区域**：你 GUI 里已有"Select Region"，框掉黑边/无关 UI，进一步减小。
+
+## 什么时候要保留高分辨率
+
+如果你的目标在画面里**很小**（比如远处小怪、地面掉落物只有几十像素）：
+
+- 缩到 640 训练后,目标可能只剩十几像素 → 难检测。
+- 这时**别降太狠**，训练用更大的 `imgsz`，例如：
+  ```powershell
+  yolo detect train data=d4.yaml model=yolo11s.pt imgsz=1280 epochs=100
+  ```
+- 存图建议保留 **1280 或原始**，JPG q90~95，兼顾清晰度和体积。
+
+## 给你的具体建议
+
+- 怪物/Boss 这类**较大目标** → 存 **JPG，缩到 1280 宽**，训练 `imgsz=640` 足够。
+- 小掉落物/图标 → 存 **JPG 原始 2560×1440 或 1280**，训练 `imgsz=1280`。
+
+---
+
+要不要我给 GUI 的采集模块加上 **格式（PNG/JPG）+ JPG 质量 + 可选缩放宽度** 三个选项？默认设成 **JPG / q90 / 不缩放**，你采图时直接就是小体积，省去事后批量转换。
+
+---
+
+**User**
+
+要
+
+---
+
+**Cursor**
+
+I'll add format (PNG/JPG), JPG quality, and optional resize-width options to the capture module. Let me view the current capture UI and loop code.
+
+I'll add a format/quality/resize row and shift Start/Stop down.
+
+Now update `on_cap_start` to validate the new options and pass them to the loop, and update `_capture_loop`.
+
+The section grew by two rows; bump the window height a bit.
+
+已加好格式/质量/缩放三个选项，编译通过、无 lint 错误。
+
+## 新增控件（默认值按 YOLO 数据集优化）
+
+| 控件 | 说明 | 默认值 |
+|------|------|--------|
+| **Format** | 下拉选 `jpg` / `png` | **`jpg`** |
+| **JPG quality** | JPG 压缩质量 1–100（选 png 时忽略） | **`90`** |
+| **Max width (0=keep)** | 超过该宽度则等比缩小；`0` = 不缩放 | **`0`** |
+
+## 行为说明
+
+- **默认即小体积**：开箱就是 `JPG / q90 / 不缩放`，你 2560×1440 的图从 ~5MB PNG 降到 ~0.5–1MB JPG。
+- **缩放**：填如 `1280`，宽于 1280 的帧会等比缩到 1280 宽（用 `INTER_AREA`，缩小画质最好），约再降到 150–300KB；填 `0` 保持原始尺寸。
+- **裁剪 + 缩放顺序**：先按 region 裁剪，再按 max width 缩放，最后编码保存。
+- 文件名后缀随格式自动变 `.jpg` / `.png`。
+- 参数有校验：质量非整数、宽度非整数会报错并拒绝启动。
+- 启动日志会回显当前设置，如：`[capture] started -> ... (every 1s, region=None, jpg/q90, max_w=1280)`。
+
+## 建议配置
+
+- **大目标（怪/Boss）**：`jpg` / `q90` / `max_w=1280`，训练 `imgsz=640`。
+- **小目标（掉落/图标）**：`jpg` / `q92` / `max_w=0`（保原图），训练 `imgsz=1280`。
+
+直接 `python -m examples.gui_test` 打开，在「Dataset capture」里调好这三项再 Start 即可。
+
+---
+
+**User**
+
+针对暗黑4的游戏截图，你推荐使用yolo11哪个模型进行训练
+
+---
+
+**Cursor**
+
+结合你现在的环境（2560×1440、可框区域、推理走 **ONNX + onnxruntime**、bot 里多半 **CPU + 低频检测**），暗黑4 自定义训练可以这样选 YOLO11。
+
+## 首选推荐：`yolo11s.pt`
+
+**最均衡的起点**，适合「自己采图 + 几百～一两千张」这种规模：
+
+| 方面 | 说明 |
+|------|------|
+| 精度 | 比 `n` 稳，对 D4 的光效、粒子、半透明 UI 更扛得住 |
+| 速度 | CPU 上单帧通常还能压在可接受范围（配合 `region`） |
+| 过拟合 | 数据量不大时，比 `m/l` 不容易训过头 |
+| 导出 | `yolo export format=onnx` 后给 `nge/detect.py` 直接用 |
+
+```powershell
+yolo detect train data=d4.yaml model=yolo11s.pt epochs=100 imgsz=640
+yolo export model=runs/detect/train/weights/best.pt format=onnx
+```
+
+## 按目标大小选
+
+### 1. 画面上目标偏大（怪、Boss、明显标记，框选后占画面不少）
+→ **`yolo11s` + `imgsz=640`**（默认就够用）
+
+### 2. 目标偏小（远处怪、地面掉落、小地图点、血条旁图标）
+→ 仍建议 **`yolo11s`**，但训练/推理都抬高分辨率：
+
+```powershell
+yolo detect train data=d4.yaml model=yolo11s.pt epochs=100 imgsz=1280
+```
+
+采集时 GUI 里 **`Max width` 可先设 `0`（保原图）或 `1920`**，别过早缩到 1280 以下。
+
+### 3. 必须极致省资源、能接受漏检
+→ **`yolo11n.pt`**  
+Bot 里每 0.3～0.5s 检一次、只检小区域时可用；D4 画面复杂时，**n 容易漏小目标**，一般不当作第一选择。
+
+### 4. 数据很多（2000+ 张、类别多、场景杂）且训练用 GPU
+→ 可试 **`yolo11m.pt`**  
+精度上限更高，但 **ONNX 在 CPU 上明显变慢**，和「轻量 bot」目标冲突，除非你打算检测也上 GPU。
+
+### 5. 不推荐起步用：`l` / `x`
+- 小数据集极易过拟合  
+- 导出 ONNX 大、CPU 推理慢  
+- 对「点怪、找标记」这类 bot 任务性价比低  
+
+## 和「截图 5MB」的关系（训练侧）
+
+- 存图：**JPG q90**，大目标可 **`max_w=1280`**。  
+- 训练：**`imgsz=640` 或 `1280`** 由 ultralytics 自动 letterbox，**不必用 2560 原图训练**。  
+- 模型大小（n/s/m）和「单张 PNG 5MB」是两回事；**先把图存小，再选 s 模型**即可。
+
+## 实操顺序（建议你就按这个走）
+
+1. **`yolo11s` + `imgsz=640`**，先训一版看 mAP 和实机 `ctx.find_object` 效果。  
+2. 小目标漏得多 → 同一权重思路，改 **`imgsz=1280`** 再训（或加数据），仍用 **s**。  
+3. 仍慢/仍漏 → 再考虑 **m（GPU 训练+推理）** 或 **缩小检测区域 + 略降 conf**。
+
+## 一句话
+
+- **默认：`yolo11s`**（暗黑4 自定义数据集最稳的第一选择）  
+- **要小目标：仍是 s，把 `imgsz` 提到 1280**  
+- **要极快、可牺牲精度：`yolo11n`**  
+- **数据很大且追求上限：`yolo11m`（配合 GPU 更合理）**
+
+你主要检测的是哪一类（全屏怪、掉落物、还是小地图/任务标记）？可以说一下，我可以把 `imgsz`、采集 `max_w` 和 bot 里 `conf` 收成一套更具体的参数。
+
+---
+
+**User**
+
+yolo11s.pt和yolo11s.onnx有什么区别
+
+---
+
+**Cursor**
+
+核心区别：`yolo11s.pt` 是 **PyTorch 训练/原始权重格式**，`yolo11s.onnx` 是 **导出的推理计算图格式**。你可以理解为：`pt` 用来“开发和训练”，`onnx` 用来“部署和运行”。
+
+## 对比表
+
+| 项目 | `yolo11s.pt` | `yolo11s.onnx` |
+|---|---|---|
+| 本质 | PyTorch checkpoint | ONNX 静态计算图 |
+| 依赖 | `torch` + `ultralytics` | `onnxruntime`（CPU）或 `onnxruntime-gpu` |
+| 用途 | 训练、微调、继续训练、导出 | 纯推理部署 |
+| 能否训练 | ✅ | ❌ |
+| 启动/体积 | 重、慢一些 | 轻、快一些 |
+| 可移植性 | 主要 PyTorch 生态 | 跨框架/跨语言更好 |
+| 你当前项目适配 | 训练阶段用 | 运行阶段（`nge/detect.py`）用 |
+
+## 在你项目里的正确用法
+
+1. 训练/微调时用 `pt`：
+```bash
+yolo detect train data=d4.yaml model=yolo11s.pt epochs=100 imgsz=640
+```
+
+2. 训练完导出 `onnx` 给 bot：
+```bash
+yolo export model=runs/detect/train/weights/best.pt format=onnx
+```
+
+3. 运行时加载 `best.onnx`：
+- `YoloDetector(...onnx)`  
+- 不需要常驻 PyTorch，依赖更干净。
+
+## 额外提醒
+
+- `yolo11s.onnx` 只是官方预训练模型导出的版本（COCO 类别），不一定识别你的暗黑4目标。  
+- 真正要用在 D4，通常是你训练出的 `best.pt` 再导出 `best.onnx`。  
+- 一般会有轻微数值差异（NMS/精度），但正确导出后效果通常接近。
 

@@ -30,7 +30,14 @@ class Match:
 
 def load_template(path: str) -> np.ndarray:
     """Load a template image as BGR."""
-    img = cv2.imread(path, cv2.IMREAD_COLOR)
+    # cv2.imread cannot open non-ASCII paths on Windows; decode from bytes instead.
+    try:
+        data = np.fromfile(path, dtype=np.uint8)
+        img = cv2.imdecode(data, cv2.IMREAD_COLOR) if data.size else None
+    except OSError:
+        img = None
+    if img is None:
+        img = cv2.imread(path, cv2.IMREAD_COLOR)
     if img is None:
         raise FileNotFoundError(f"Template not found: {path}")
     return img
@@ -60,6 +67,33 @@ def find_template(
         width=tw,
         height=th,
     )
+
+
+def find_template_in_region(
+    frame: np.ndarray,
+    template: np.ndarray,
+    region: tuple[int, int, int, int],
+    threshold: float = 0.85,
+    frame_offset: tuple[int, int] = (0, 0),
+) -> Match | None:
+    """Return the best match of ``template`` inside ``region`` (l, t, r, b).
+
+    Coordinates are in screen space. When ``frame`` is a crop of the full
+    screen, pass its top-left corner in ``frame_offset`` so results map back
+    to screen coordinates.
+    """
+    l, t, r, b = region
+    ox, oy = frame_offset
+    ll, tt, rr, bb = l - ox, t - oy, r - ox, b - oy
+    h, w = frame.shape[:2]
+    ll, tt = max(0, min(ll, w)), max(0, min(tt, h))
+    rr, bb = max(0, min(rr, w)), max(0, min(bb, h))
+    if ll >= rr or tt >= bb:
+        return None
+    crop = frame[tt:bb, ll:rr]
+    if crop.size == 0:
+        return None
+    return find_template(crop, template, threshold, region_offset=(l, t))
 
 
 def find_all(

@@ -43,7 +43,7 @@ from .controller import Controller
 from .detect import Detection, YoloDetector
 from .logger import get_logger
 from .ocr import OCREngine, OCRResult, Region
-from .vision import Match, find_all, find_template, load_template
+from .vision import Match, find_all, find_template, find_template_in_region, load_template
 
 log = get_logger(__name__)
 
@@ -88,6 +88,18 @@ class BotContext:
     _ocr: OCREngine | None = None
     _detector: YoloDetector | None = None
 
+    def refresh_frame(self) -> bool:
+        """Grab a new screenshot and replace :attr:`frame`.
+
+        Call after in-rule actions (clicks, key presses, delays) that change
+        the screen before another detect/find pass in the same tick.
+        """
+        frame = self.capture.grab()
+        if frame is None:
+            return False
+        self.frame = frame
+        return True
+
     def find(self, template_path: str, threshold: float = 0.85) -> Match | None:
         """Find the best match of a template in the current frame."""
         tpl = self._template(template_path)
@@ -97,6 +109,20 @@ class BotContext:
         """Find all matches of a template in the current frame."""
         tpl = self._template(template_path)
         return find_all(self.frame, tpl, threshold, self._region_offset)
+
+    def find_in_region(
+        self,
+        template_path: str,
+        region: tuple[int, int, int, int],
+        threshold: float = 0.85,
+    ) -> Match | None:
+        """Find the best template match inside ``region`` (screen-space l, t, r, b)."""
+        if self.frame is None:
+            return None
+        tpl = self._template(template_path)
+        return find_template_in_region(
+            self.frame, tpl, region, threshold, frame_offset=self._region_offset
+        )
 
     @property
     def ocr(self) -> OCREngine:

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import math
 import random
+import time
 from dataclasses import dataclass
 
 
@@ -48,6 +49,24 @@ class HumanizeConfig:
     pause_chance: float = 0.00
     # Hesitation pause duration range in seconds (min, max).
     pause_range: tuple[float, float] = (0.04, 0.14)
+
+
+def random_delay(
+    min_ms: float,
+    max_ms: float,
+    *,
+    rng: random.Random | None = None,
+) -> float:
+    """Sleep for a random duration between ``min_ms`` and ``max_ms`` milliseconds.
+
+    Returns the slept duration in seconds.
+    """
+    lo_ms, hi_ms = min(min_ms, max_ms), max(min_ms, max_ms)
+    rng = rng or random.Random()
+    delay = rng.uniform(lo_ms, hi_ms) / 1000.0
+    if delay > 0:
+        time.sleep(delay)
+    return delay
 
 
 def _ease_in_out(t: float) -> float:

@@ -76,10 +76,17 @@ class Controller:
         px: float,
         py: float,
         duration: float | None = None,
+        spread: float = 0.0,
     ) -> None:
-        """Move the pointer to a pixel coordinate along a human-like path."""
+        """Move the pointer to a pixel coordinate along a human-like path.
+
+        ``spread`` is the landing-point scatter radius in pixels. When > 0 the
+        actual destination is randomized uniformly within a disc of that radius
+        around (px, py).
+        """
+        tx, ty = self._scatter(px, py, spread)
         path = generate_path(
-            self._pos, (px, py), duration=duration, config=self.humanize, rng=self.rng
+            self._pos, (tx, ty), duration=duration, config=self.humanize, rng=self.rng
         )
         for wp in path:
             if wp.delay > 0:
@@ -110,8 +117,7 @@ class Controller:
         the exact same pixel.
         """
         if px is not None and py is not None:
-            tx, ty = self._scatter(px, py, spread)
-            self.move_to(tx, ty, duration=duration)
+            self.move_to(px, py, duration=duration, spread=spread)
             time.sleep(self.rng.uniform(0.02, 0.06))
         hold_ms = (
             int(hold * 1000)
